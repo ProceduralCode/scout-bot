@@ -239,20 +239,6 @@ class Game:
 			scores.append(score)
 		return scores
 
-	def get_rewards(self) -> list[float]:
-		"""Normalized rewards for each player at game end.
-		Reward = (score margin vs next-highest + 5 if winner) / 20."""
-		assert self.phase == Phase.GAME_OVER
-		max_score = max(self.cumulative_scores)
-		rewards = []
-		for i in range(self.num_players):
-			my_score = self.cumulative_scores[i]
-			next_highest = max(s for j, s in enumerate(self.cumulative_scores) if j != i)
-			margin = my_score - next_highest
-			bonus = 5 if my_score >= max_score else 0
-			rewards.append((margin + bonus) / 20.0)
-		return rewards
-
 	def get_state_for_player(self, player: int) -> dict:
 		"""Visible game state from a player's perspective, for encoding.
 		All per-player arrays are rotated so index 0 = requesting player,

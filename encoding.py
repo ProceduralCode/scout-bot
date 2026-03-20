@@ -1,5 +1,5 @@
 import torch
-from game import Game, Play, Phase
+from game import Game, Play, PlayType, Phase
 
 HAND_SLOTS = 20
 PLAY_SLOTS = 10
@@ -19,10 +19,10 @@ PLAY_SIZE = PLAY_SLOTS * CARD_VALUES * 2
 #   4  opponent S&S availability, zero-padded
 #   3  player count one-hot (3/4/5)
 #   1  scouts since play, normalized
-#   4  play owner relative position one-hot (1-4 seats away)
+#   5  play owner relative position one-hot (0=self, 1-4 seats away)
 #   1  round progress (round/total_rounds)
-# Total: 34
-METADATA_SIZE = 34
+# Total: 35
+METADATA_SIZE = 35
 INPUT_SIZE = HAND_SIZE + PLAY_SIZE + METADATA_SIZE
 ACTION_TYPE_SIZE = 9
 PLAY_START_SIZE = 20
@@ -53,26 +53,104 @@ def decode_action_type(index: int) -> dict:
 # --- Legal move helpers ---
 
 def get_legal_plays(hand: list, current_play: Play | None) -> list[tuple[int, int]]:
-	"""Return (start, end) pairs for all legal plays from this hand."""
+	"""Return (start, end) pairs for all legal plays from this hand.
+	Uses precomputed run lengths to avoid constructing Play objects."""
+	n = len(hand)
+	if n == 0:
+		return []
+	values = [c[0] for c in hand]
+	# Precompute max contiguous run length starting at each position
+	set_len = [1] * n
+	asc_len = [1] * n
+	desc_len = [1] * n
+	for i in range(n - 2, -1, -1):
+		if values[i] == values[i + 1]:
+			set_len[i] = set_len[i + 1] + 1
+		if values[i + 1] == values[i] + 1:
+			asc_len[i] = asc_len[i + 1] + 1
+		if values[i + 1] == values[i] - 1:
+			desc_len[i] = desc_len[i + 1] + 1
+	# Extract beats-check info once
+	if current_play is not None:
+		cp_count = current_play.count
+		cp_is_set = current_play.play_type == PlayType.SET
+		cp_strength = current_play.strength
 	plays = []
-	for start in range(len(hand)):
-		for end in range(start, len(hand)):
-			candidate = Play.from_cards(hand[start:end + 1])
-			if candidate is None:
+	for start in range(n):
+		max_run = max(set_len[start], asc_len[start], desc_len[start])
+		for end in range(start, min(start + max_run, n)):
+			length = end - start + 1
+			# Classify: set > ascending run > descending run (precedence)
+			if length <= set_len[start]:
+				is_set = True
+				strength = values[start]
+			elif length <= asc_len[start]:
+				is_set = False
+				strength = values[end]
+			elif length <= desc_len[start]:
+				is_set = False
+				strength = values[start]
+			else:
 				continue
-			if current_play is None or candidate.beats(current_play):
-				plays.append((start, end))
+			# Inline beats check
+			if current_play is not None:
+				if length < cp_count:
+					continue
+				if length == cp_count:
+					if is_set != cp_is_set:
+						if not is_set:
+							continue
+					elif strength <= cp_strength:
+						continue
+			plays.append((start, end))
 	return plays
 
 def _has_any_legal_play(hand: list, current_play: Play | None) -> bool:
-	"""Check if any legal play exists (short-circuits on first match)."""
+	"""Check if any legal play exists (short-circuits on first match).
+	Uses precomputed run lengths to avoid constructing Play objects."""
 	if current_play is None:
 		return len(hand) > 0
-	for start in range(len(hand)):
-		for end in range(start, len(hand)):
-			candidate = Play.from_cards(hand[start:end + 1])
-			if candidate is not None and candidate.beats(current_play):
-				return True
+	n = len(hand)
+	if n == 0:
+		return False
+	values = [c[0] for c in hand]
+	set_len = [1] * n
+	asc_len = [1] * n
+	desc_len = [1] * n
+	for i in range(n - 2, -1, -1):
+		if values[i] == values[i + 1]:
+			set_len[i] = set_len[i + 1] + 1
+		if values[i + 1] == values[i] + 1:
+			asc_len[i] = asc_len[i + 1] + 1
+		if values[i + 1] == values[i] - 1:
+			desc_len[i] = desc_len[i + 1] + 1
+	cp_count = current_play.count
+	cp_is_set = current_play.play_type == PlayType.SET
+	cp_strength = current_play.strength
+	for start in range(n):
+		max_run = max(set_len[start], asc_len[start], desc_len[start])
+		for end in range(start, min(start + max_run, n)):
+			length = end - start + 1
+			if length <= set_len[start]:
+				is_set = True
+				strength = values[start]
+			elif length <= asc_len[start]:
+				is_set = False
+				strength = values[end]
+			elif length <= desc_len[start]:
+				is_set = False
+				strength = values[start]
+			else:
+				continue
+			if length < cp_count:
+				continue
+			if length == cp_count:
+				if is_set != cp_is_set:
+					if not is_set:
+						continue
+				elif strength <= cp_strength:
+					continue
+			return True
 	return False
 
 def _sns_variant_legal(hand: list, play_cards: list, left_end: bool, flip: bool) -> bool:
@@ -183,9 +261,9 @@ def _encode_metadata(state: dict) -> list[float]:
 	# Scouts since current play, normalized by (num_players - 1)
 	denom = max(num_players - 1, 1)
 	buf.append(state["scouts_since_play"] / denom)
-	# Play owner relative position one-hot (4 slots: 1-4 seats away)
+	# Play owner relative position one-hot (5 slots: 0=self, 1-4 seats away)
 	owner_pos = state["play_owner_relative_pos"]
-	for dist in range(1, 5):
+	for dist in range(5):
 		buf.append(1.0 if owner_pos == dist else 0.0)
 	# Round progress
 	total = state["total_rounds"]
@@ -238,7 +316,8 @@ def get_action_type_mask(game: Game, legal_plays: list[tuple[int, int]]) -> torc
 	if legal_plays:
 		mask[0] = True
 
-	if has_play:
+	# Scout/S&S only if there's a table play and hand has room
+	if has_play and len(hand) < HAND_SLOTS:
 		play_cards = game.current_play.cards
 		# Scout: always legal if there's a play to scout from
 		mask[1] = True  # left normal
@@ -284,11 +363,29 @@ def get_play_end_mask(legal_plays: list[tuple[int, int]], start: int, hand_offse
 
 def get_scout_insert_mask(game: Game) -> torch.Tensor:
 	"""Return a boolean mask of shape [21] for legal scout insert positions.
-	All positions 0 to len(hand) are legal."""
+	All positions 0 to len(hand) are legal, capped to SCOUT_INSERT_SIZE."""
 	hand_len = len(game.players[game.current_player].hand)
 	mask = torch.zeros(SCOUT_INSERT_SIZE, dtype=torch.bool)
-	for pos in range(hand_len + 1):
+	for pos in range(min(hand_len + 1, SCOUT_INSERT_SIZE)):
 		mask[pos] = True
+	return mask
+
+def get_sns_insert_mask(game: Game, left_end: bool, flip: bool) -> torch.Tensor:
+	"""Return a boolean mask of shape [21] for S&S insert positions.
+	Only positions where inserting the scouted card yields a hand with
+	at least one legal play against the reduced play are legal."""
+	hand = game.players[game.current_player].hand
+	play_cards = list(game.current_play.cards)
+	remaining = list(play_cards)
+	card = remaining.pop(0) if left_end else remaining.pop()
+	if flip:
+		card = (card[1], card[0])
+	reduced_play = Play.from_cards(remaining) if remaining else None
+	mask = torch.zeros(SCOUT_INSERT_SIZE, dtype=torch.bool)
+	for pos in range(min(len(hand) + 1, SCOUT_INSERT_SIZE)):
+		new_hand = hand[:pos] + [card] + hand[pos:]
+		if _has_any_legal_play(new_hand, reduced_play):
+			mask[pos] = True
 	return mask
 
 def decode_slot_to_hand_index(slot: int, hand_offset: int) -> int:

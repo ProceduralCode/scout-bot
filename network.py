@@ -7,21 +7,39 @@ from encoding import (
 
 CONDITIONING_SIZE = ACTION_TYPE_SIZE + PLAY_START_SIZE # 29
 
-class ScoutNetwork(nn.Module):
-	def __init__(self, input_size: int = INPUT_SIZE, hidden_size: int = 128, first_hidden_size: int = 256):
+class ResidualBlock(nn.Module):
+	"""Skip connection for same-width consecutive layers."""
+	def __init__(self, size: int):
 		super().__init__()
-		self.hidden_size = hidden_size
-		self.shared = nn.Sequential(
-			nn.Linear(input_size, first_hidden_size),
-			nn.ReLU(),
-			nn.Linear(first_hidden_size, hidden_size),
-			nn.ReLU(),
-		)
-		self.value_head = nn.Linear(hidden_size, 1)
-		self.action_type_head = nn.Linear(hidden_size + CONDITIONING_SIZE, ACTION_TYPE_SIZE)
-		self.play_start_head = nn.Linear(hidden_size + CONDITIONING_SIZE, PLAY_START_SIZE)
-		self.play_end_head = nn.Linear(hidden_size + CONDITIONING_SIZE, PLAY_END_SIZE)
-		self.scout_insert_head = nn.Linear(hidden_size + CONDITIONING_SIZE, SCOUT_INSERT_SIZE)
+		self.linear = nn.Linear(size, size)
+		self.relu = nn.ReLU()
+	def forward(self, x: Tensor) -> Tensor:
+		return self.relu(self.linear(x) + x)
+
+class ScoutNetwork(nn.Module):
+	def __init__(self, input_size: int = INPUT_SIZE, layer_sizes: list[int] | None = None,
+				 hidden_size: int = 128, first_hidden_size: int = 256):
+		super().__init__()
+		# Backward compat: convert old format
+		if layer_sizes is None:
+			layer_sizes = [first_hidden_size, hidden_size]
+		self.layer_sizes = layer_sizes
+		layers = []
+		prev_size = input_size
+		for size in layer_sizes:
+			if size == prev_size:
+				layers.append(ResidualBlock(size))
+			else:
+				layers.append(nn.Linear(prev_size, size))
+				layers.append(nn.ReLU())
+			prev_size = size
+		self.shared = nn.Sequential(*layers)
+		output_size = layer_sizes[-1]
+		self.value_head = nn.Linear(output_size, 1)
+		self.action_type_head = nn.Linear(output_size + CONDITIONING_SIZE, ACTION_TYPE_SIZE)
+		self.play_start_head = nn.Linear(output_size + CONDITIONING_SIZE, PLAY_START_SIZE)
+		self.play_end_head = nn.Linear(output_size + CONDITIONING_SIZE, PLAY_END_SIZE)
+		self.scout_insert_head = nn.Linear(output_size + CONDITIONING_SIZE, SCOUT_INSERT_SIZE)
 
 	def _build_conditioning(self, hidden: Tensor, action_type_idx: int | None, start_idx: int | None) -> Tensor:
 		"""Concatenate hidden state with one-hot conditioning vectors."""
@@ -75,14 +93,38 @@ class ScoutNetwork(nn.Module):
 		conditioned = self._build_conditioning(hidden, action_type, None)
 		return self.scout_insert_head(conditioned)
 
-def masked_sample(logits: Tensor, mask: Tensor) -> tuple[int, Tensor]:
-	"""Sample from masked logits. Returns (sampled_index, log_prob)."""
-	masked_logits = logits.clone()
-	masked_logits[~mask] = float('-inf')
-	probs = torch.softmax(masked_logits, dim=-1)
-	idx = torch.multinomial(probs, 1).item()
-	log_prob = torch.log_softmax(masked_logits, dim=-1)[idx]
-	return idx, log_prob
+class RandomBot:
+	"""Bot that plays uniformly random legal actions. For evaluation baseline.
+	Duck-types ScoutNetwork: zero logits → uniform distribution after masking."""
+
+	def __call__(self, x: Tensor) -> Tensor:
+		return torch.zeros(1)
+
+	def eval(self):
+		return self
+
+	def value(self, hidden: Tensor) -> Tensor:
+		return torch.tensor(0.0)
+
+	def action_type_logits(self, hidden: Tensor) -> Tensor:
+		return torch.zeros(ACTION_TYPE_SIZE)
+
+	def play_start_logits(self, hidden: Tensor, action_type: int) -> Tensor:
+		return torch.zeros(PLAY_START_SIZE)
+
+	def play_end_logits(self, hidden: Tensor, action_type: int, start: int) -> Tensor:
+		return torch.zeros(PLAY_END_SIZE)
+
+	def scout_insert_logits(self, hidden: Tensor, action_type: int) -> Tensor:
+		return torch.zeros(SCOUT_INSERT_SIZE)
+
+def masked_sample(logits: Tensor, mask: Tensor) -> tuple[int, None]:
+	"""Sample from masked logits using Gumbel-max trick. Returns (sampled_index, None).
+	Log prob is not computed since no caller uses it."""
+	u = torch.rand_like(logits).clamp(1e-10, 1.0)
+	noisy = logits - torch.log(-torch.log(u))
+	noisy = noisy.masked_fill(~mask, float('-inf'))
+	return noisy.argmax().item(), None
 
 def masked_log_prob(logits: Tensor, mask: Tensor, action: int) -> Tensor:
 	"""Compute log probability of a specific action under masked logits."""
