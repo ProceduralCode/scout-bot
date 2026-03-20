@@ -1,9 +1,9 @@
 import torch
 import argparse
 import time
-from Scout.encoding import INPUT_SIZE
-from Scout.network import ScoutNetwork
-from Scout.training import play_game, ReplayBuffer, OpponentPool, compute_advantages, ppo_update
+from encoding import INPUT_SIZE
+from network import ScoutNetwork
+from training import play_game, ReplayBuffer, OpponentPool, compute_advantages, ppo_update
 
 # TODO: All hyperparameters are initial guesses — tune empirically
 DEFAULT_CONFIG = {

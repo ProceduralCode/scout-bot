@@ -3,13 +3,14 @@ import torch.nn.functional as F
 import random
 import copy
 from dataclasses import dataclass
-from Scout.game import Game, Phase
-from Scout.encoding import (
+from game import Game, Phase
+from encoding import (
 	encode_state, encode_hand_both_orientations, get_action_type_mask,
 	get_play_start_mask, get_play_end_mask, get_scout_insert_mask,
-	decode_action_type, decode_slot_to_hand_index, HAND_SLOTS,
+	get_legal_plays, decode_action_type, decode_slot_to_hand_index,
+	HAND_SLOTS, PLAY_SLOTS,
 )
-from Scout.network import ScoutNetwork, masked_sample, masked_log_prob
+from network import ScoutNetwork, masked_sample, masked_log_prob
 
 @dataclass
 class StepRecord:
@@ -68,14 +69,16 @@ def _play_round(game: Game, networks: list[ScoutNetwork]) -> list[StepRecord]:
 	for p in range(game.num_players):
 		net = networks[p]
 		with torch.no_grad():
-			t_normal, t_flipped = encode_hand_both_orientations(game, p)
+			ho = random.randint(0, HAND_SLOTS - 1)
+			po = random.randint(0, PLAY_SLOTS - 1)
+			t_normal, t_flipped = encode_hand_both_orientations(game, p, ho, po)
 			h_normal = net(t_normal)
 			h_flipped = net(t_flipped)
 			v_normal = net.value(h_normal).item()
 			v_flipped = net.value(h_flipped).item()
 		game.submit_flip_decision(p, do_flip=(v_flipped > v_normal))
 	# Play turns
-	while game.phase == Phase.PLAY:
+	while game.phase == Phase.TURN:
 		step_records = _play_turn(game, networks)
 		records.extend(step_records)
 	return records
@@ -85,14 +88,18 @@ def _play_turn(game: Game, networks: list[ScoutNetwork]) -> list[StepRecord]:
 	p = game.current_player
 	net = networks[p]
 	hand_offset = random.randint(0, HAND_SLOTS - 1)
+	play_offset = random.randint(0, PLAY_SLOTS - 1)
 	records = []
 	with torch.no_grad():
-		state_tensor = encode_state(game, p, hand_offset=hand_offset)
+		state_tensor = encode_state(game, p, hand_offset, play_offset)
 		hidden = net(state_tensor)
 		value = net.value(hidden).item()
+		# Compute legal plays once for all mask functions
+		hand = game.players[p].hand
+		legal_plays = get_legal_plays(hand, game.current_play)
 		# Step 1: action type
 		at_logits = net.action_type_logits(hidden)
-		at_mask = get_action_type_mask(game)
+		at_mask = get_action_type_mask(game, legal_plays)
 		action_type, at_log_prob = masked_sample(at_logits, at_mask)
 		rec = StepRecord(
 			state=state_tensor,
@@ -106,7 +113,7 @@ def _play_turn(game: Game, networks: list[ScoutNetwork]) -> list[StepRecord]:
 		if action_info["type"] == "play":
 			# Step 2: play start
 			ps_logits = net.play_start_logits(hidden, action_type)
-			ps_mask = get_play_start_mask(game, hand_offset)
+			ps_mask = get_play_start_mask(legal_plays, hand_offset)
 			start_slot, _ = masked_sample(ps_logits, ps_mask)
 			start_idx = decode_slot_to_hand_index(start_slot, hand_offset)
 			rec.play_start = start_slot
@@ -114,7 +121,7 @@ def _play_turn(game: Game, networks: list[ScoutNetwork]) -> list[StepRecord]:
 			rec.play_start_mask = ps_mask
 			# Step 3: play end
 			pe_logits = net.play_end_logits(hidden, action_type, start_slot)
-			pe_mask = get_play_end_mask(game, start_idx, hand_offset)
+			pe_mask = get_play_end_mask(legal_plays, start_idx, hand_offset)
 			end_slot, _ = masked_sample(pe_logits, pe_mask)
 			end_idx = decode_slot_to_hand_index(end_slot, hand_offset)
 			rec.play_end = end_slot
