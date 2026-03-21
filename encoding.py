@@ -361,19 +361,21 @@ def get_play_end_mask(legal_plays: list[tuple[int, int]], start: int, hand_offse
 			mask[slot] = True
 	return mask
 
-def get_scout_insert_mask(game: Game) -> torch.Tensor:
+def get_scout_insert_mask(game: Game, hand_offset: int) -> torch.Tensor:
 	"""Return a boolean mask of shape [21] for legal scout insert positions.
-	All positions 0 to len(hand) are legal, capped to SCOUT_INSERT_SIZE."""
+	Positions correspond to encoded hand slots (with hand_offset applied)."""
 	hand_len = len(game.players[game.current_player].hand)
 	mask = torch.zeros(SCOUT_INSERT_SIZE, dtype=torch.bool)
 	for pos in range(min(hand_len + 1, SCOUT_INSERT_SIZE)):
-		mask[pos] = True
+		slot = (hand_offset + pos) % SCOUT_INSERT_SIZE
+		mask[slot] = True
 	return mask
 
-def get_sns_insert_mask(game: Game, left_end: bool, flip: bool) -> torch.Tensor:
+def get_sns_insert_mask(game: Game, left_end: bool, flip: bool, hand_offset: int) -> torch.Tensor:
 	"""Return a boolean mask of shape [21] for S&S insert positions.
 	Only positions where inserting the scouted card yields a hand with
-	at least one legal play against the reduced play are legal."""
+	at least one legal play against the reduced play are legal.
+	Positions correspond to encoded hand slots (with hand_offset applied)."""
 	hand = game.players[game.current_player].hand
 	play_cards = list(game.current_play.cards)
 	remaining = list(play_cards)
@@ -385,7 +387,8 @@ def get_sns_insert_mask(game: Game, left_end: bool, flip: bool) -> torch.Tensor:
 	for pos in range(min(len(hand) + 1, SCOUT_INSERT_SIZE)):
 		new_hand = hand[:pos] + [card] + hand[pos:]
 		if _has_any_legal_play(new_hand, reduced_play):
-			mask[pos] = True
+			slot = (hand_offset + pos) % SCOUT_INSERT_SIZE
+			mask[slot] = True
 	return mask
 
 def decode_slot_to_hand_index(slot: int, hand_offset: int) -> int:

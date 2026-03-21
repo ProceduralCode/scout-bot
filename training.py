@@ -9,7 +9,7 @@ from encoding import (
 	get_play_start_mask, get_play_end_mask, get_scout_insert_mask,
 	get_sns_insert_mask,
 	get_legal_plays, decode_action_type, decode_slot_to_hand_index,
-	HAND_SLOTS, PLAY_SLOTS, ACTION_TYPE_SIZE, PLAY_START_SIZE,
+	HAND_SLOTS, PLAY_SLOTS, ACTION_TYPE_SIZE, PLAY_START_SIZE, SCOUT_INSERT_SIZE,
 )
 from network import ScoutNetwork, masked_sample, masked_log_prob
 from game_log import GameLog
@@ -39,11 +39,16 @@ class StepRecord:
 	player: int = 0
 	round_num: int = 0
 	game_id: int = 0
+	play_length: int | None = None
+	scout_quality: int | None = None
 
 def play_game(network: ScoutNetwork, num_players: int,
 			  opponent_pool: list[ScoutNetwork] | None = None,
 			  game_log: GameLog | None = None,
-			  training_seats: int = 1) -> list[StepRecord]:
+			  training_seats: int = 1,
+			  reward_distribution: str = "terminal",  # "terminal", "uniform", or float 0-1 (uniform fraction)
+			  reward_mode: str = "game_score",
+			  shaped_bonus_scale: float = 0.0) -> list[StepRecord]:
 	"""Play a complete game using the network, recording all decisions.
 	First training_seats players use the training network, rest from opponent_pool.
 	Only returns records from players using the training network — opponent
@@ -64,19 +69,47 @@ def play_game(network: ScoutNetwork, num_players: int,
 		if game_log:
 			game_log.record_round_start(game)
 		round_records = _play_round(game, networks, game_log)
-		# Only last step per player per round gets the reward (for GAE)
-		# Reward is margin vs mean opponent score, not absolute score
-		round_scores = game.get_round_scores()
-		last_by_player: dict[int, int] = {}
+		# Assign rewards to each player's steps
 		for i, rec in enumerate(round_records):
 			rec.round_num = round_idx
 			rec.reward = 0.0
-			last_by_player[rec.player] = i
-		for i in last_by_player.values():
-			p = round_records[i].player
-			opponent_scores = [round_scores[j] for j in range(len(round_scores)) if j != p]
-			mean_opponent = sum(opponent_scores) / len(opponent_scores)
-			round_records[i].reward = (round_scores[p] - mean_opponent) / 10.0
+		if reward_mode == "play_length":
+			for rec in round_records:
+				rec.reward = rec.play_length / 5.0 if rec.play_length is not None else 0.0
+		elif reward_mode == "play_and_scout":
+			for rec in round_records:
+				if rec.play_length is not None:
+					rec.reward = rec.play_length / 5.0
+				elif rec.scout_quality is not None:
+					rec.reward = (rec.scout_quality - 1) / 8.0
+		else:  # "game_score"
+			round_scores = game.get_round_scores()
+			player_indices: dict[int, list[int]] = {}
+			for i, rec in enumerate(round_records):
+				player_indices.setdefault(rec.player, []).append(i)
+			# Parse distribution: "terminal", "uniform", or float 0-1 (uniform fraction)
+			if reward_distribution == "uniform":
+				uniform_frac = 1.0
+			elif reward_distribution == "terminal":
+				uniform_frac = 0.0
+			else:
+				uniform_frac = float(reward_distribution)
+			for player_id, indices in player_indices.items():
+				opponent_scores = [round_scores[j] for j in range(len(round_scores)) if j != player_id]
+				mean_opponent = sum(opponent_scores) / len(opponent_scores)
+				round_reward = (round_scores[player_id] - mean_opponent) / 10.0
+				if uniform_frac > 0:
+					per_step = round_reward * uniform_frac / len(indices)
+					for i in indices:
+						round_records[i].reward = per_step
+				if uniform_frac < 1:
+					round_records[indices[-1]].reward += round_reward * (1 - uniform_frac)
+		if shaped_bonus_scale > 0:
+			for rec in round_records:
+				if rec.play_length is not None:
+					rec.reward += rec.play_length / 5.0 * shaped_bonus_scale
+				elif rec.scout_quality is not None:
+					rec.reward += (rec.scout_quality - 1) / 8.0 * shaped_bonus_scale
 		all_records.extend(round_records)
 		if game_log:
 			game_log.record_round_end(game)
@@ -177,17 +210,19 @@ def _play_turn(game: Game, networks: list[ScoutNetwork],
 			rec.play_end = end_slot
 			rec.play_end_logits = pe_logits
 			rec.play_end_mask = pe_mask
+			rec.play_length = end_idx - start_idx + 1
 			records.append(rec)
 			played_cards = hand[start_idx:end_idx + 1]
 			game.apply_play(start_idx, end_idx)
 			if game_log:
 				game_log.record_play(game, p, played_cards, round_num=round_num)
 		elif action_info["type"] == "scout":
-			# Step 2: insert position
+			# Step 2: insert position (slot space, like play_start/play_end)
 			si_logits = net.scout_insert_logits(hidden, action_type)
-			si_mask = get_scout_insert_mask(game)
-			insert_pos, _ = masked_sample(si_logits, si_mask)
-			rec.scout_insert = insert_pos
+			si_mask = get_scout_insert_mask(game, hand_offset)
+			insert_slot, _ = masked_sample(si_logits, si_mask)
+			insert_pos = (insert_slot - hand_offset) % SCOUT_INSERT_SIZE
+			rec.scout_insert = insert_slot
 			rec.scout_insert_logits = si_logits
 			rec.scout_insert_mask = si_mask
 			records.append(rec)
@@ -197,15 +232,22 @@ def _play_turn(game: Game, networks: list[ScoutNetwork],
 			scouted = play_cards[0] if left_end else play_cards[-1]
 			if action_info["flip"]:
 				scouted = (scouted[1], scouted[0])
+			new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
+			max_len = 1
+			for s, e in get_legal_plays(new_hand, None):
+				if s <= insert_pos <= e:
+					max_len = max(max_len, e - s + 1)
+			rec.scout_quality = max_len
 			game.apply_scout(left_end, action_info["flip"], insert_pos)
 			if game_log:
 				game_log.record_scout(game, p, scouted, left_end, insert_pos, round_num=round_num)
 		elif action_info["type"] == "sns":
 			# Scout portion — use restricted mask so insert guarantees a legal play
 			si_logits = net.scout_insert_logits(hidden, action_type)
-			si_mask = get_sns_insert_mask(game, action_info["left_end"], action_info["flip"])
-			insert_pos, _ = masked_sample(si_logits, si_mask)
-			rec.scout_insert = insert_pos
+			si_mask = get_sns_insert_mask(game, action_info["left_end"], action_info["flip"], hand_offset)
+			insert_slot, _ = masked_sample(si_logits, si_mask)
+			insert_pos = (insert_slot - hand_offset) % SCOUT_INSERT_SIZE
+			rec.scout_insert = insert_slot
 			rec.scout_insert_logits = si_logits
 			rec.scout_insert_mask = si_mask
 			records.append(rec)
@@ -215,6 +257,12 @@ def _play_turn(game: Game, networks: list[ScoutNetwork],
 			scouted = play_cards[0] if left_end else play_cards[-1]
 			if action_info["flip"]:
 				scouted = (scouted[1], scouted[0])
+			new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
+			max_len = 1
+			for s, e in get_legal_plays(new_hand, None):
+				if s <= insert_pos <= e:
+					max_len = max(max_len, e - s + 1)
+			rec.scout_quality = max_len
 			game.apply_sns_scout(left_end, action_info["flip"], insert_pos)
 			if game_log:
 				game_log.record_scout(game, p, scouted, left_end, insert_pos, round_num=round_num)
@@ -330,7 +378,9 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 			   steps: list[StepRecord], advantages: list[float],
 			   clip_epsilon: float = 0.2, entropy_bonus: float = 0.01,
 			   value_loss_coeff: float = 0.25, max_grad_norm: float = 0.5,
-			   returns: list[float] | None = None):
+			   returns: list[float] | None = None,
+			   entropy_floors: dict[str, float] | None = None,
+			   entropy_floor_coeff: float = 1.0):
 	"""One PPO update step. Batched forward pass for efficiency."""
 	n = len(steps)
 	empty_metrics = {
@@ -338,6 +388,7 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		"clip_fraction": 0.0, "approx_kl": 0.0, "explained_variance": 0.0,
 		"entropy_action_type": 0.0, "entropy_play_start": 0.0,
 		"entropy_play_end": 0.0, "entropy_scout_insert": 0.0,
+		"entropy_floor_penalty": 0.0,
 	}
 	if n == 0:
 		return empty_metrics
@@ -364,10 +415,21 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 				 - _batched_masked_log_prob(old_at_logits, at_masks, at_actions))
 	at_ent = _batched_masked_entropy(at_logits, at_masks)
 	entropy = at_ent.clone()
-	at_entropy_mean = at_ent.mean().item()
+	def _filtered_ent_mean(ent, masks):
+		"""Mean entropy over steps with 2+ legal options (matches floor logic)."""
+		has_choice = masks.sum(dim=-1) >= 2
+		if has_choice.any():
+			return ent[has_choice].mean().item()
+		return 0.0
+	at_entropy_mean = _filtered_ent_mean(at_ent, at_masks)
 	ps_entropy_mean = 0.0
 	pe_entropy_mean = 0.0
 	si_entropy_mean = 0.0
+	# Track per-head entropy tensors and masks for floor penalty
+	_head_ent = {"action_type": (at_ent, at_masks)}
+	_head_ent["play_start"] = None
+	_head_ent["play_end"] = None
+	_head_ent["scout_insert"] = None
 
 	# Sub-head indices
 	play_idx = [i for i, s in enumerate(steps) if s.play_start is not None]
@@ -391,7 +453,8 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		ps_ent = _batched_masked_entropy(logits, masks)
 		log_ratio = log_ratio + torch.zeros(n).scatter(0, idx_t, delta)
 		entropy = entropy + torch.zeros(n).scatter(0, idx_t, ps_ent)
-		ps_entropy_mean = ps_ent.mean().item()
+		ps_entropy_mean = _filtered_ent_mean(ps_ent, masks)
+		_head_ent["play_start"] = (ps_ent, masks)
 
 	# Play end
 	if end_idx:
@@ -409,7 +472,8 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		pe_ent = _batched_masked_entropy(logits, masks)
 		log_ratio = log_ratio + torch.zeros(n).scatter(0, idx_t, delta)
 		entropy = entropy + torch.zeros(n).scatter(0, idx_t, pe_ent)
-		pe_entropy_mean = pe_ent.mean().item()
+		pe_entropy_mean = _filtered_ent_mean(pe_ent, masks)
+		_head_ent["play_end"] = (pe_ent, masks)
 
 	# Scout insert
 	if scout_idx:
@@ -427,7 +491,8 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		si_ent = _batched_masked_entropy(logits, masks)
 		log_ratio = log_ratio + torch.zeros(n).scatter(0, idx_t, delta)
 		entropy = entropy + torch.zeros(n).scatter(0, idx_t, si_ent)
-		si_entropy_mean = si_ent.mean().item()
+		si_entropy_mean = _filtered_ent_mean(si_ent, masks)
+		_head_ent["scout_insert"] = (si_ent, masks)
 
 	# PPO clipped objective
 	adv = torch.tensor(advantages, dtype=torch.float32)
@@ -437,6 +502,25 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 	policy_loss = -torch.min(surr1, surr2).mean()
 
 	loss = policy_loss + value_loss_coeff * value_loss - entropy_bonus * entropy.mean()
+
+	# Per-head entropy floor penalty: quadratic penalty when mean entropy
+	# drops below the floor, only for steps with 2+ legal options
+	floor_penalty_val = 0.0
+	if entropy_floors:
+		floor_penalty = torch.tensor(0.0)
+		for key, pair in _head_ent.items():
+			floor = entropy_floors.get(key, 0.0)
+			if floor <= 0 or pair is None:
+				continue
+			ent_tensor, mask_tensor = pair
+			has_choice = mask_tensor.sum(dim=-1) >= 2
+			if not has_choice.any():
+				continue
+			mean_ent = ent_tensor[has_choice].mean()
+			violation = torch.clamp(floor - mean_ent, min=0.0)
+			floor_penalty = floor_penalty + violation ** 2
+		loss = loss + entropy_floor_coeff * floor_penalty
+		floor_penalty_val = floor_penalty.item()
 
 	if torch.isnan(loss):
 		print(f"  WARNING: NaN loss detected (policy={policy_loss.item()}, value={value_loss.item()}, entropy={entropy.mean().item()})")
@@ -469,4 +553,5 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		"entropy_play_start": ps_entropy_mean,
 		"entropy_play_end": pe_entropy_mean,
 		"entropy_scout_insert": si_entropy_mean,
+		"entropy_floor_penalty": floor_penalty_val,
 	}

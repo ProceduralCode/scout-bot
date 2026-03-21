@@ -9,7 +9,7 @@ from encoding import (
 	get_play_start_mask, get_play_end_mask, get_scout_insert_mask,
 	get_sns_insert_mask,
 	get_legal_plays, decode_action_type, decode_slot_to_hand_index,
-	INPUT_SIZE, HAND_SLOTS, PLAY_SLOTS,
+	INPUT_SIZE, HAND_SLOTS, PLAY_SLOTS, SCOUT_INSERT_SIZE,
 )
 from network import ScoutNetwork, masked_sample
 from display import parse_cards, format_hand, format_play, format_card
@@ -198,10 +198,11 @@ class LiveGame:
 			elif action_info["type"] in ("scout", "sns"):
 				si_logits = network.scout_insert_logits(hidden, action_type)
 				if action_info["type"] == "sns":
-					si_mask = get_sns_insert_mask(self, action_info["left_end"], action_info["flip"])
+					si_mask = get_sns_insert_mask(self, action_info["left_end"], action_info["flip"], hand_offset)
 				else:
-					si_mask = get_scout_insert_mask(self)
-				insert_pos, _ = masked_sample(si_logits, si_mask)
+					si_mask = get_scout_insert_mask(self, hand_offset)
+				insert_slot, _ = masked_sample(si_logits, si_mask)
+				insert_pos = (insert_slot - hand_offset) % SCOUT_INSERT_SIZE
 				result["left_end"] = action_info["left_end"]
 				result["flip"] = action_info["flip"]
 				result["insert_pos"] = insert_pos

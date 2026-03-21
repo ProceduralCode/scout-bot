@@ -10,6 +10,7 @@ from encoding import INPUT_SIZE
 from network import ScoutNetwork, RandomBot
 from training import play_game, play_eval_game, OpponentPool, compute_gae, ppo_update
 from game_log import GameLog
+from probe import eval_scout_quality
 
 # TODO: All hyperparameters are initial guesses — tune empirically
 DEFAULT_CONFIG = {
@@ -18,28 +19,38 @@ DEFAULT_CONFIG = {
 	# "layer_sizes": [256, 128],  # old shallow network
 	"learning_rate": 3e-4,
 	# "batch_size": 256,  # TODO: implement mini-batching within PPO epochs
-	"games_per_iteration": 200,
+	"games_per_iteration": 100,
 	"ppo_epochs": 4, # passes over the batch per iteration
 	"clip_epsilon": 0.2,
 	"entropy_bonus": 0.01,
 	# "entropy_bonus": 0.05,
 	# "entropy_bonus": 0.25,
+	"entropy_floors": {
+		"action_type": 0.05,
+		"play_start": 0.05,
+		"play_end": 0.05, # 91% of steps have 1 option; floor targets the 9% with 2+
+		"scout_insert": 0.05,
+	},
+	"entropy_floor_coeff": 1.0,
+	"reward_mode": "game_score",  # "game_score", "play_length", or "play_and_scout"
+	"reward_distribution": 0.7,  # "terminal", "uniform", or 0-1 uniform fraction (game_score mode only)
+	"shaped_bonus_scale": 0.05,  # per-action bonus for play_length and scout_quality
 	"value_loss_coeff": 0.25,
 	"gamma": 0.99,
 	"gae_lambda": 0.95,
-	"training_seats": 3,
+	"training_seats": 4,
 	"opponent_pool_size": 10,
-	"snapshot_interval": 35, # add to pool every N iterations
+	"snapshot_interval": 30, # add to pool every N iterations
 	"total_iterations": 1_000_000,
 	"log_interval": 1,
 	"save_interval": 100,
 	"eval_interval": 8,
-	"save_dir": "v2_4",
+	"save_dir": "v3_4",
 	"eval_opponents": {
-		"v1_3": "v1_3/latest.pt",
 		"v1_4": "v1_4/latest.pt",
-		"v2_2": "v2_2/latest.pt",
-		"v2_3": "v2_3/latest.pt",
+		# "v2_2": "v2_2/latest.pt",
+		"v2_5": "v2_5/latest.pt",
+		"v3_1": "v3_1/latest.pt",
 	}, # name → checkpoint path
 }
 
@@ -74,7 +85,25 @@ def _save_charts(metrics_history: dict, save_dir: str):
 	iters = metrics_history["iteration"]
 	if len(iters) < 2:
 		return
+	# Trim noisy early iterations from charts when there's enough data
+	trim = 30 if len(iters) > 400 else 10 if len(iters) > 100 else 0
+	iters = iters[trim:]
+	all_eval_iters = metrics_history.get("eval_iteration", [])
+	eval_trim = sum(1 for ei in all_eval_iters if ei <= trim) if trim else 0
+	eval_iters = all_eval_iters[eval_trim:]
 	chart_path = os.path.join(save_dir, "charts.png")
+
+	# Precompute trimmed and smoothed data for all metrics
+	trimmed = {}
+	smoothed = {}
+	for k, vals in metrics_history.items():
+		if k in ("iteration", "eval_iteration") or not vals:
+			continue
+		t = eval_trim if k.startswith("eval_") else trim
+		trimmed[k] = vals[t:]
+		w = max(len(trimmed[k]) // 10, 3)
+		smoothed[k] = _smooth(trimmed[k], w) if len(trimmed[k]) >= w else trimmed[k]
+
 	BG = "#1a1a2e"
 	PANEL = "#16213e"
 	TEXT = "#e0e0e0"
@@ -82,20 +111,17 @@ def _save_charts(metrics_history: dict, save_dir: str):
 	GRID = "#ffffff"
 
 	with plt.style.context("dark_background"):
-		fig, axes = plt.subplots(4, 3, figsize=(14, 20))
+		fig, axes = plt.subplots(4, 4, figsize=(18, 20))
 		fig.patch.set_facecolor(BG)
 		fig.suptitle("Scout Bot Training", fontsize=16, color=TEXT, y=0.98)
 
 		def plot_line(ax, key, title, desc, color):
-			vals = metrics_history.get(key, [])
 			ax.set_facecolor(PANEL)
-			if vals:
-				ax.plot(iters[:len(vals)], vals, alpha=0.25, color=color, linewidth=0.8)
-				window = max(len(vals) // 10, 10)
-				if len(vals) >= window:
-					ax.plot(iters[:len(vals)], _smooth(vals, window), color=color, linewidth=2)
+			if key in trimmed:
+				ax.plot(iters[:len(trimmed[key])], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
+				ax.plot(iters[:len(smoothed[key])], smoothed[key], color=color, linewidth=2)
 			ax.set_title(title, color=TEXT, fontsize=11)
-			ax.text(0.5, -0.15, textwrap.fill(desc, 50), transform=ax.transAxes,
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
 					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
@@ -103,59 +129,67 @@ def _save_charts(metrics_history: dict, save_dir: str):
 		def plot_multi(ax, series, title, desc, ylim=None):
 			ax.set_facecolor(PANEL)
 			for key, label, color in series:
-				vals = metrics_history.get(key, [])
-				if vals:
-					window = max(len(vals) // 10, 10)
-					if len(vals) >= window:
-						ax.plot(iters[:len(vals)], _smooth(vals, window),
-								color=color, linewidth=1.5, label=label)
-					else:
-						ax.plot(iters[:len(vals)], vals,
-								color=color, linewidth=1, alpha=0.5, label=label)
+				if key in trimmed:
+					ax.plot(iters[:len(smoothed[key])], smoothed[key],
+							color=color, linewidth=1.5, label=label)
 			if ylim:
 				ax.set_ylim(*ylim)
 			ax.legend(fontsize=7, loc="upper right")
 			ax.set_title(title, color=TEXT, fontsize=11)
-			ax.text(0.5, -0.15, textwrap.fill(desc, 50), transform=ax.transAxes,
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
+					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			ax.tick_params(colors=SUBTEXT, labelsize=8)
+			ax.grid(True, alpha=0.15, color=GRID)
+
+		def _style_eval_ax(ax, title, desc):
+			"""Style helper for charts using eval_iteration x-axis."""
+			ax.set_title(title, color=TEXT, fontsize=11)
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
 					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 
 		# Row 0: Core performance
 		plot_line(axes[0, 0], "reward", "Avg Reward (P0)",
-			"Mean reward per step for the training player. Positive = winning more than losing.", "#5dadec")
+			"Mean per-round reward for the training player. Positive = winning more than losing.", "#5dadec")
 		plot_line(axes[0, 1], "value", "Value Prediction",
 			"Mean value function output. Should track reward. Divergence = value function miscalibrated.", "#e0aaff")
-		# Eval chart (special handling for different x-axis, multiple opponents)
+		# Score Margin (eval x-axis, multiple opponents)
 		ax_eval = axes[0, 2]
 		ax_eval.set_facecolor(PANEL)
-		eval_iters = metrics_history.get("eval_iteration", [])
-		eval_margin = metrics_history.get("eval_margin", [])
-		if eval_iters and eval_margin:
-			ax_eval.plot(eval_iters, eval_margin, color="#b197fc",
-						linewidth=2, marker="o", markersize=3, label="vs Random")
+		if "eval_margin" in trimmed:
+			ax_eval.plot(eval_iters[:len(trimmed["eval_margin"])], trimmed["eval_margin"],
+						color="#b197fc", alpha=0.25, linewidth=0.8)
+			ax_eval.plot(eval_iters[:len(smoothed["eval_margin"])], smoothed["eval_margin"],
+						color="#b197fc", linewidth=2, label="vs Random")
 		opponent_colors = ["#ff6b6b", "#69db7c", "#ffa552", "#5dadec"]
-		opponent_keys = sorted(k for k in metrics_history if k.startswith("eval_margin_"))
+		opponent_keys = sorted(k for k in smoothed if k.startswith("eval_margin_"))
 		for i, key in enumerate(opponent_keys):
 			name = key[len("eval_margin_"):]
-			vals = metrics_history.get(key, [])
-			if vals:
-				ax_eval.plot(eval_iters[:len(vals)], vals,
-							color=opponent_colors[i % len(opponent_colors)],
-							linewidth=2, marker="o", markersize=3, label=f"vs {name}")
+			c = opponent_colors[i % len(opponent_colors)]
+			ax_eval.plot(eval_iters[:len(trimmed[key])], trimmed[key],
+						color=c, alpha=0.25, linewidth=0.8)
+			ax_eval.plot(eval_iters[:len(smoothed[key])], smoothed[key],
+						color=c, linewidth=2, label=f"vs {name}")
 		ax_eval.axhline(y=0, color="#666666", linestyle="--", alpha=0.5)
 		if ax_eval.get_legend_handles_labels()[1]:
 			ax_eval.legend(fontsize=7, loc="upper left")
-		ax_eval.set_title("Score Margin", color=TEXT, fontsize=11)
-		ax_eval.text(0.5, -0.15,
-			textwrap.fill("P0 score minus best opponent, averaged over eval games. Positive = winning.", 50),
-			transform=ax_eval.transAxes, ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
-		ax_eval.tick_params(colors=SUBTEXT, labelsize=8)
-		ax_eval.grid(True, alpha=0.15, color=GRID)
+		_style_eval_ax(ax_eval, "Score Margin",
+			"P0 score minus mean opponent, averaged over eval games. Positive = winning.")
+		# Scout Play Length (eval x-axis)
+		ax_sq = axes[0, 3]
+		ax_sq.set_facecolor(PANEL)
+		if "scout_play_len" in trimmed:
+			ax_sq.plot(eval_iters[:len(trimmed["scout_play_len"])], trimmed["scout_play_len"],
+					   color="#e0aaff", alpha=0.25, linewidth=0.8)
+			ax_sq.plot(eval_iters[:len(smoothed["scout_play_len"])], smoothed["scout_play_len"],
+					   color="#e0aaff", linewidth=2)
+		_style_eval_ax(ax_sq, "Scout Play Length",
+			"Avg longest set/run containing scouted card after insertion. 1.0 = no play, 2.0 = pairs. Random ~1.5.")
 
 		# Row 1: Loss & entropy
 		plot_line(axes[1, 0], "policy_loss", "Policy Loss",
-			"PPO clipped surrogate loss. Not directly interpretable; watch for instability (spikes or divergence).", "#ff6b6b")
+			"PPO clipped surrogate loss. Watch for instability (spikes or divergence).", "#ff6b6b")
 		plot_line(axes[1, 1], "value_loss", "Value Loss",
 			"MSE between predicted and actual returns. Should decrease as value function improves.", "#ffa552")
 		plot_multi(axes[1, 2], [
@@ -164,15 +198,19 @@ def _save_charts(metrics_history: dict, save_dir: str):
 			("entropy_play_end", "Play End", "#ffa552"),
 			("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
 		], "Per-Head Entropy",
-			"Entropy per decision head. High = uncertain, low = confident. Collapsing entropy may signal premature convergence.")
+			"Entropy per head (steps with 2+ options only). Collapsing = premature convergence. Compare to floors in config.")
+		plot_line(axes[1, 3], "entropy_floor_penalty", "Entropy Floor Penalty",
+			"Quadratic penalty when head entropy drops below floor. >0 = floor active. 0 = heads above floor.", "#ff922b")
 
 		# Row 2: PPO health
 		plot_line(axes[2, 0], "clip_fraction", "Clip Fraction",
-			"Fraction of samples clipped by PPO. Values <0.01 are typical with masked multi-head actions.", "#ff922b")
+			"Fraction of samples clipped by PPO. <0.01 typical with masked multi-head actions.", "#ff922b")
 		plot_line(axes[2, 1], "approx_kl", "Approx KL Divergence",
-			"How far the policy moved from the collection policy. >0.05 = aggressive updates, risk of instability.", "#74c0fc")
+			"How far policy moved from collection policy. >0.05 = aggressive updates, risk of instability.", "#74c0fc")
 		plot_line(axes[2, 2], "explained_variance", "Explained Variance",
-			"How well the value function predicts returns. ~0 = useless baseline, ~1 = perfect predictions.", "#69db7c")
+			"How well value function predicts returns. ~0 = useless baseline, ~1 = perfect.", "#69db7c")
+		plot_line(axes[2, 3], "advantage_std", "Advantage Std (pre-norm)",
+			"Std of raw advantages before normalization. <0.01 = weak learning signal.", "#ffd43b")
 
 		# Row 3: Behavioral
 		plot_multi(axes[3, 0], [
@@ -180,18 +218,56 @@ def _save_charts(metrics_history: dict, save_dir: str):
 			("scout_pct", "Scout", "#5dadec"),
 			("sns_pct", "S&S", "#ff6b6b"),
 		], "Action Type Distribution",
-			"Fraction of each action type chosen per iteration. Shows how strategy evolves over training.",
+			"Fraction of each action type. Shows how strategy evolves over training.",
 			ylim=(0, 1))
 		plot_line(axes[3, 1], "steps_per_game", "Steps Per Game",
-			"Average decisions per game for the training player. Shorter games may indicate more decisive play.", "#e0aaff")
-		plot_line(axes[3, 2], "advantage_std", "Advantage Std (pre-norm)",
-			"Std of raw advantages before normalization. <0.01 = all actions look equally good, weak learning signal.", "#ffd43b")
+			"Average decisions per game. Shorter games may indicate more decisive play.", "#e0aaff")
+		plot_line(axes[3, 2], "avg_play_length", "Avg Play Length",
+			"Mean cards per play action. Higher = learning longer sequences instead of 1-card plays.", "#69db7c")
+		plot_line(axes[3, 3], "reward_std", "Reward Std",
+			"Std of per-round rewards. High = noisy signal, low = consistent outcomes.", "#74c0fc")
 
-		fig.subplots_adjust(left=0.06, right=0.98, top=0.96, bottom=0.03,
+		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
 						   hspace=0.40, wspace=0.25)
 		fig.savefig(chart_path, dpi=100, facecolor=fig.get_facecolor(),
 					bbox_inches='tight', pad_inches=0.15)
 		plt.close(fig)
+
+	# Write text summary with smoothed values
+	summary_path = os.path.join(save_dir, "summary.txt")
+	lines = [f"=== Run: {len(iters)} iterations (trimmed first {trim}) ===\n"]
+
+	def _snap_idx(n):
+		count = min(n, 5)
+		step = (n - 1) / (count - 1) if count > 1 else 0
+		return [round(i * step) for i in range(count)]
+
+	# Training metrics
+	idx = _snap_idx(len(iters))
+	lines.append("iters: " + ", ".join(str(iters[i]) for i in idx))
+	for k in smoothed:
+		if k.startswith("eval_"):
+			continue
+		kidx = idx if len(smoothed[k]) >= len(iters) else _snap_idx(len(smoothed[k]))
+		vals = [f"{smoothed[k][i]:.4f}" for i in kidx]
+		lines.append(f"  {k}: {', '.join(vals)}")
+	lines.append("")
+
+	# Eval metrics
+	eval_sm_keys = [k for k in smoothed if k.startswith("eval_")]
+	if eval_sm_keys:
+		lines.append("=== Eval ===\n")
+		eidx = _snap_idx(len(eval_iters))
+		lines.append("iters: " + ", ".join(str(eval_iters[i]) for i in eidx))
+		for k in eval_sm_keys:
+			kidx = eidx if len(smoothed[k]) >= len(eval_iters) else _snap_idx(len(smoothed[k]))
+			fmt = "+.2f" if "margin" in k else ".4f"
+			vals = [f"{smoothed[k][i]:{fmt}}" for i in kidx]
+			lines.append(f"  {k}: {', '.join(vals)}")
+		lines.append("")
+
+	with open(summary_path, "w") as f:
+		f.write("\n".join(lines))
 
 def train(config: dict | None = None):
 	cfg = {**DEFAULT_CONFIG, **(config or {})}
@@ -205,9 +281,12 @@ def train(config: dict | None = None):
 		"clip_fraction": [], "approx_kl": [], "explained_variance": [],
 		"entropy_action_type": [], "entropy_play_start": [],
 		"entropy_play_end": [], "entropy_scout_insert": [],
+		"entropy_floor_penalty": [],
 		"play_pct": [], "scout_pct": [], "sns_pct": [],
 		"steps_per_game": [], "advantage_std": [],
+		"avg_play_length": [], "reward_std": [],
 		"eval_iteration": [], "eval_margin": [],
+		"scout_play_len": [],
 	}
 	start_iter = 1
 	# Auto-resume if save dir has a checkpoint
@@ -261,7 +340,6 @@ def train(config: dict | None = None):
 		  f"PPO epochs={cfg['ppo_epochs']}")
 	print(f"Output: {save_dir}/")
 	iteration = start_iter
-	stopped = False
 	try:
 		for iteration in range(start_iter, cfg["total_iterations"] + 1):
 			t0 = time.time()
@@ -271,7 +349,10 @@ def train(config: dict | None = None):
 			for game_idx in range(cfg["games_per_iteration"]):
 				opponents = pool.sample(cfg["num_players"] - cfg["training_seats"]) or None
 				records = play_game(network, cfg["num_players"], opponent_pool=opponents,
-									training_seats=cfg["training_seats"])
+									training_seats=cfg["training_seats"],
+									reward_distribution=cfg.get("reward_distribution", "terminal"),
+									reward_mode=cfg.get("reward_mode", "game_score"),
+									shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
 				for r in records:
 					r.game_id = game_idx
 				iteration_records.extend(records)
@@ -291,6 +372,8 @@ def train(config: dict | None = None):
 					entropy_bonus=cfg["entropy_bonus"],
 					value_loss_coeff=cfg["value_loss_coeff"],
 					returns=returns,
+					entropy_floors=cfg.get("entropy_floors"),
+					entropy_floor_coeff=cfg.get("entropy_floor_coeff", 1.0),
 				)
 				# Epoch 0: ratios must be ~1.0 (policy hasn't changed yet)
 				if epoch == 0 and abs(m["mean_ratio"] - 1.0) > 0.01:
@@ -306,9 +389,15 @@ def train(config: dict | None = None):
 			# Logging + metrics + latest save
 			if iteration % cfg["log_interval"] == 0:
 				p0_records = [r for r in iteration_records if r.player == 0]
-				# Per-round reward (only non-zero steps are round-end rewards)
-				p0_rewards = [r.reward for r in p0_records if r.reward != 0.0]
+				# Per-round reward: sum steps within each round so metric is
+				# comparable across terminal vs uniform reward distribution
+				round_totals: dict[tuple[int,int], float] = {}
+				for r in p0_records:
+					key = (r.game_id, r.round_num)
+					round_totals[key] = round_totals.get(key, 0.0) + r.reward
+				p0_rewards = list(round_totals.values())
 				avg_reward = sum(p0_rewards) / max(len(p0_rewards), 1)
+				reward_std = (sum((r - avg_reward)**2 for r in p0_rewards) / max(len(p0_rewards), 1)) ** 0.5
 				avg_value = sum(r.value for r in p0_records) / max(len(p0_records), 1)
 				# Behavioral metrics
 				n_steps = len(iteration_records)
@@ -320,19 +409,24 @@ def train(config: dict | None = None):
 				sns_pct = n_sns / max(n_steps, 1)
 				steps_per_game = n_steps / cfg["games_per_iteration"]
 				adv_std = adv_std_val
+				play_lengths = [r.play_length for r in iteration_records if r.play_length is not None]
+				avg_play_length = sum(play_lengths) / max(len(play_lengths), 1)
 				metrics_history["iteration"].append(iteration)
 				metrics_history["reward"].append(avg_reward)
 				metrics_history["value"].append(avg_value)
 				for k in ("policy_loss", "value_loss", "entropy",
 						  "clip_fraction", "approx_kl", "explained_variance",
 						  "entropy_action_type", "entropy_play_start",
-						  "entropy_play_end", "entropy_scout_insert"):
+						  "entropy_play_end", "entropy_scout_insert",
+						  "entropy_floor_penalty"):
 					metrics_history[k].append(ppo_avg[k])
 				metrics_history["play_pct"].append(play_pct)
 				metrics_history["scout_pct"].append(scout_pct)
 				metrics_history["sns_pct"].append(sns_pct)
 				metrics_history["steps_per_game"].append(steps_per_game)
 				metrics_history["advantage_std"].append(adv_std)
+				metrics_history["avg_play_length"].append(avg_play_length)
+				metrics_history["reward_std"].append(reward_std)
 				print(f"[iter {iteration:>5}] "
 					  f"reward={avg_reward:+.3f}  value={avg_value:+.3f}  "
 					  f"ploss={ppo_avg['policy_loss']:.4f}  vloss={ppo_avg['value_loss']:.4f}  "
@@ -379,17 +473,18 @@ def train(config: dict | None = None):
 					avg_margin = total_margin / n_eval
 					metrics_history[f"eval_margin_{name}"].append(avg_margin)
 					print(f"  Eval vs {name}: margin={avg_margin:+.1f}")
+				# Scout placement quality
+				scout_len, scout_n = eval_scout_quality(network, n_samples=200)
+				metrics_history["scout_play_len"].append(scout_len)
+				print(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
 				_save_charts(metrics_history, save_dir)
 	except KeyboardInterrupt:
-		stopped = True
-		print(f"\nInterrupted at iteration {iteration}. Saving...")
+		print(f"\nInterrupted at iteration {iteration}.")
+		return
 	# Final save
 	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
 	_save_charts(metrics_history, save_dir)
-	if stopped:
-		print(f"Saved to {save_dir}/latest.pt")
-	else:
-		print(f"Training complete. Saved to {save_dir}/latest.pt")
+	print(f"Training complete. Saved to {save_dir}/latest.pt")
 
 def main():
 	parser = argparse.ArgumentParser(description="Train a Scout card game bot")
