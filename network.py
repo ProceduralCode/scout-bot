@@ -5,8 +5,6 @@ from encoding import (
 	INPUT_SIZE, ACTION_TYPE_SIZE, PLAY_START_SIZE, PLAY_END_SIZE, SCOUT_INSERT_SIZE,
 )
 
-CONDITIONING_SIZE = ACTION_TYPE_SIZE + PLAY_START_SIZE # 29
-
 class ResidualBlock(nn.Module):
 	"""Skip connection for same-width consecutive layers."""
 	def __init__(self, size: int):
@@ -18,12 +16,16 @@ class ResidualBlock(nn.Module):
 
 class ScoutNetwork(nn.Module):
 	def __init__(self, input_size: int = INPUT_SIZE, layer_sizes: list[int] | None = None,
-				 hidden_size: int = 128, first_hidden_size: int = 256):
+				 hidden_size: int = 128, first_hidden_size: int = 256,
+				 play_start_size: int = PLAY_START_SIZE, play_end_size: int = PLAY_END_SIZE,
+				 scout_insert_size: int = SCOUT_INSERT_SIZE, encoding_version: int = 1):
 		super().__init__()
 		# Backward compat: convert old format
 		if layer_sizes is None:
 			layer_sizes = [first_hidden_size, hidden_size]
 		self.layer_sizes = layer_sizes
+		self.encoding_version = encoding_version
+		self.play_start_size = play_start_size
 		layers = []
 		prev_size = input_size
 		for size in layer_sizes:
@@ -35,11 +37,12 @@ class ScoutNetwork(nn.Module):
 			prev_size = size
 		self.shared = nn.Sequential(*layers)
 		output_size = layer_sizes[-1]
+		conditioning_size = ACTION_TYPE_SIZE + play_start_size
 		self.value_head = nn.Linear(output_size, 1)
-		self.action_type_head = nn.Linear(output_size + CONDITIONING_SIZE, ACTION_TYPE_SIZE)
-		self.play_start_head = nn.Linear(output_size + CONDITIONING_SIZE, PLAY_START_SIZE)
-		self.play_end_head = nn.Linear(output_size + CONDITIONING_SIZE, PLAY_END_SIZE)
-		self.scout_insert_head = nn.Linear(output_size + CONDITIONING_SIZE, SCOUT_INSERT_SIZE)
+		self.action_type_head = nn.Linear(output_size + conditioning_size, ACTION_TYPE_SIZE)
+		self.play_start_head = nn.Linear(output_size + conditioning_size, play_start_size)
+		self.play_end_head = nn.Linear(output_size + conditioning_size, play_end_size)
+		self.scout_insert_head = nn.Linear(output_size + conditioning_size, scout_insert_size)
 
 	def _build_conditioning(self, hidden: Tensor, action_type_idx: int | None, start_idx: int | None) -> Tensor:
 		"""Concatenate hidden state with one-hot conditioning vectors."""
@@ -48,6 +51,7 @@ class ScoutNetwork(nn.Module):
 			hidden = hidden.unsqueeze(0)
 		batch_size = hidden.shape[0]
 		device = hidden.device
+		pss = self.play_start_size
 		# Build action type one-hot
 		if action_type_idx is not None and action_type_idx >= 0:
 			action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
@@ -56,10 +60,10 @@ class ScoutNetwork(nn.Module):
 			action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
 		# Build start index one-hot
 		if start_idx is not None and start_idx >= 0:
-			start_oh = torch.zeros(batch_size, PLAY_START_SIZE, device=device)
+			start_oh = torch.zeros(batch_size, pss, device=device)
 			start_oh[:, start_idx] = 1.0
 		else:
-			start_oh = torch.zeros(batch_size, PLAY_START_SIZE, device=device)
+			start_oh = torch.zeros(batch_size, pss, device=device)
 		conditioned = torch.cat([hidden, action_oh, start_oh], dim=1)
 		if unbatched:
 			conditioned = conditioned.squeeze(0)
@@ -97,6 +101,14 @@ class RandomBot:
 	"""Bot that plays uniformly random legal actions. For evaluation baseline.
 	Duck-types ScoutNetwork: zero logits → uniform distribution after masking."""
 
+	def __init__(self, encoding_version: int = 1,
+				 play_start_size: int = PLAY_START_SIZE, play_end_size: int = PLAY_END_SIZE,
+				 scout_insert_size: int = SCOUT_INSERT_SIZE):
+		self.encoding_version = encoding_version
+		self._play_start_size = play_start_size
+		self._play_end_size = play_end_size
+		self._scout_insert_size = scout_insert_size
+
 	def __call__(self, x: Tensor) -> Tensor:
 		return torch.zeros(1)
 
@@ -110,13 +122,20 @@ class RandomBot:
 		return torch.zeros(ACTION_TYPE_SIZE)
 
 	def play_start_logits(self, hidden: Tensor, action_type: int) -> Tensor:
-		return torch.zeros(PLAY_START_SIZE)
+		return torch.zeros(self._play_start_size)
 
 	def play_end_logits(self, hidden: Tensor, action_type: int, start: int) -> Tensor:
-		return torch.zeros(PLAY_END_SIZE)
+		return torch.zeros(self._play_end_size)
 
 	def scout_insert_logits(self, hidden: Tensor, action_type: int) -> Tensor:
-		return torch.zeros(SCOUT_INSERT_SIZE)
+		return torch.zeros(self._scout_insert_size)
+
+def batched_masked_sample(logits: Tensor, mask: Tensor) -> Tensor:
+	"""Gumbel-max sampling for a batch. logits/mask: [B, C] → [B] LongTensor."""
+	u = torch.rand_like(logits).clamp(1e-10, 1.0)
+	noisy = logits - torch.log(-torch.log(u))
+	noisy = noisy.masked_fill(~mask, float('-inf'))
+	return noisy.argmax(dim=1)
 
 def masked_sample(logits: Tensor, mask: Tensor) -> tuple[int, None]:
 	"""Sample from masked logits using Gumbel-max trick. Returns (sampled_index, None).

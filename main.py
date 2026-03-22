@@ -6,18 +6,25 @@ import textwrap
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from encoding import INPUT_SIZE
+from encoding import (
+	INPUT_SIZE, INPUT_SIZE_V2,
+	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, SCOUT_INSERT_SIZE_V2,
+)
 from network import ScoutNetwork, RandomBot
-from training import play_game, play_eval_game, OpponentPool, compute_gae, ppo_update
+from training import play_game, play_games_batched, play_eval_game, OpponentPool, compute_gae, prepare_ppo_batch, ppo_update
 from game_log import GameLog
 from probe import eval_scout_quality
 
-# TODO: All hyperparameters are initial guesses — tune empirically
-DEFAULT_CONFIG = {
+PARAMS = {
 	"num_players": 4,
-	"layer_sizes": [512, 256, 256, 128, 128, 128],
 	# "layer_sizes": [256, 128],  # old shallow network
-	"learning_rate": 3e-4,
+	"layer_sizes": [512, 256, 256, 128, 128, 128],
+	# "learning_rate": 0.0001, # didn't help
+	# "learning_rate": 0.0003, # base
+	"learning_rate": 0.0004, # base
+	# "learning_rate": 0.0006, # seems slightly worse
+	# "learning_rate": 0.001, # too much
+	# "learning_rate": 0.003, # too much
 	# "batch_size": 256,  # TODO: implement mini-batching within PPO epochs
 	"games_per_iteration": 100,
 	"ppo_epochs": 4, # passes over the batch per iteration
@@ -34,7 +41,9 @@ DEFAULT_CONFIG = {
 	"entropy_floor_coeff": 1.0,
 	"reward_mode": "game_score",  # "game_score", "play_length", or "play_and_scout"
 	"reward_distribution": 0.7,  # "terminal", "uniform", or 0-1 uniform fraction (game_score mode only)
-	"shaped_bonus_scale": 0.05,  # per-action bonus for play_length and scout_quality
+	# Used this for a while to start training like 2,000 iterations and then turned it off.
+	# "shaped_bonus_scale": 0.05,  # per-action bonus for play_length and scout_quality
+	"shaped_bonus_scale": 0,  # per-action bonus for play_length and scout_quality
 	"value_loss_coeff": 0.25,
 	"gamma": 0.99,
 	"gae_lambda": 0.95,
@@ -43,15 +52,16 @@ DEFAULT_CONFIG = {
 	"snapshot_interval": 30, # add to pool every N iterations
 	"total_iterations": 1_000_000,
 	"log_interval": 1,
-	"save_interval": 100,
-	"eval_interval": 8,
-	"save_dir": "v3_4",
+	"save_interval": 500,
+	"eval_interval": 30,
+	"encoding_version": 2,
+	"save_dir": "v4_1",
 	"eval_opponents": {
+		# "random": "random", # magic word → uses RandomBot
 		"v1_4": "v1_4/latest.pt",
-		# "v2_2": "v2_2/latest.pt",
 		"v2_5": "v2_5/latest.pt",
-		"v3_1": "v3_1/latest.pt",
-	}, # name → checkpoint path
+		"v3_4": "v3_4/latest.pt",
+	}, # name → checkpoint path (or "random" for RandomBot)
 }
 
 def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, filename, pool=None, extra=None):
@@ -80,7 +90,7 @@ def _smooth(vals, window):
 		smoothed.append(sum(vals[start:end]) / (end - start))
 	return smoothed
 
-def _save_charts(metrics_history: dict, save_dir: str):
+def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[str] | None = None):
 	"""Generate training charts PNG from accumulated metrics."""
 	iters = metrics_history["iteration"]
 	if len(iters) < 2:
@@ -93,13 +103,22 @@ def _save_charts(metrics_history: dict, save_dir: str):
 	eval_iters = all_eval_iters[eval_trim:]
 	chart_path = os.path.join(save_dir, "charts.png")
 
-	# Precompute trimmed and smoothed data for all metrics
+	# Precompute trimmed and smoothed data for all metrics.
+	# Metrics may have fewer entries than iteration (added mid-training),
+	# so right-align to iteration list before trimming.
+	all_iters = metrics_history["iteration"]
 	trimmed = {}
 	smoothed = {}
 	for k, vals in metrics_history.items():
 		if k in ("iteration", "eval_iteration") or not vals:
 			continue
-		t = eval_trim if k.startswith("eval_") else trim
+		# Metrics aligned to eval_iteration x-axis
+		if k.startswith("eval_") or k == "scout_play_len":
+			start = len(all_eval_iters) - len(vals)
+			t = max(eval_trim - start, 0)
+		else:
+			start = len(all_iters) - len(vals)
+			t = max(trim - start, 0)
 		trimmed[k] = vals[t:]
 		w = max(len(trimmed[k]) // 10, 3)
 		smoothed[k] = _smooth(trimmed[k], w) if len(trimmed[k]) >= w else trimmed[k]
@@ -118,8 +137,8 @@ def _save_charts(metrics_history: dict, save_dir: str):
 		def plot_line(ax, key, title, desc, color):
 			ax.set_facecolor(PANEL)
 			if key in trimmed:
-				ax.plot(iters[:len(trimmed[key])], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
-				ax.plot(iters[:len(smoothed[key])], smoothed[key], color=color, linewidth=2)
+				ax.plot(iters[-len(trimmed[key]):], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
+				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
 					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
@@ -130,7 +149,7 @@ def _save_charts(metrics_history: dict, save_dir: str):
 			ax.set_facecolor(PANEL)
 			for key, label, color in series:
 				if key in trimmed:
-					ax.plot(iters[:len(smoothed[key])], smoothed[key],
+					ax.plot(iters[-len(smoothed[key]):], smoothed[key],
 							color=color, linewidth=1.5, label=label)
 			if ylim:
 				ax.set_ylim(*ylim)
@@ -149,83 +168,85 @@ def _save_charts(metrics_history: dict, save_dir: str):
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 
-		# Row 0: Core performance
-		plot_line(axes[0, 0], "reward", "Avg Reward (P0)",
-			"Mean per-round reward for the training player. Positive = winning more than losing.", "#5dadec")
-		plot_line(axes[0, 1], "value", "Value Prediction",
-			"Mean value function output. Should track reward. Divergence = value function miscalibrated.", "#e0aaff")
-		# Score Margin (eval x-axis, multiple opponents)
-		ax_eval = axes[0, 2]
+		# Row 0: Game performance (highest priority)
+		ax_eval = axes[0, 0]
 		ax_eval.set_facecolor(PANEL)
-		if "eval_margin" in trimmed:
-			ax_eval.plot(eval_iters[:len(trimmed["eval_margin"])], trimmed["eval_margin"],
-						color="#b197fc", alpha=0.25, linewidth=0.8)
-			ax_eval.plot(eval_iters[:len(smoothed["eval_margin"])], smoothed["eval_margin"],
-						color="#b197fc", linewidth=2, label="vs Random")
-		opponent_colors = ["#ff6b6b", "#69db7c", "#ffa552", "#5dadec"]
-		opponent_keys = sorted(k for k in smoothed if k.startswith("eval_margin_"))
+		opponent_colors = ["#b197fc", "#ff6b6b", "#69db7c", "#ffa552", "#5dadec"]
+		opponent_keys = sorted(k for k in smoothed if k.startswith("eval_margin_")
+			and (eval_opponent_names is None or k[len("eval_margin_"):] in eval_opponent_names))
 		for i, key in enumerate(opponent_keys):
 			name = key[len("eval_margin_"):]
 			c = opponent_colors[i % len(opponent_colors)]
-			ax_eval.plot(eval_iters[:len(trimmed[key])], trimmed[key],
+			ax_eval.plot(eval_iters[-len(trimmed[key]):], trimmed[key],
 						color=c, alpha=0.25, linewidth=0.8)
-			ax_eval.plot(eval_iters[:len(smoothed[key])], smoothed[key],
+			ax_eval.plot(eval_iters[-len(smoothed[key]):], smoothed[key],
 						color=c, linewidth=2, label=f"vs {name}")
 		ax_eval.axhline(y=0, color="#666666", linestyle="--", alpha=0.5)
 		if ax_eval.get_legend_handles_labels()[1]:
 			ax_eval.legend(fontsize=7, loc="upper left")
 		_style_eval_ax(ax_eval, "Score Margin",
 			"P0 score minus mean opponent, averaged over eval games. Positive = winning.")
-		# Scout Play Length (eval x-axis)
-		ax_sq = axes[0, 3]
+		plot_line(axes[0, 1], "steps_per_game", "Steps Per Game",
+			"Average decisions per game. Shorter games may indicate more decisive play.", "#e0aaff")
+		plot_multi(axes[0, 2], [
+			("play_len_1_pct", "1", "#ff6b6b"),
+			("play_len_2_pct", "2", "#ffa552"),
+			("play_len_3_pct", "3", "#69db7c"),
+			("play_len_4_pct", "4", "#5dadec"),
+			("play_len_5_pct", "5", "#b197fc"),
+			("play_len_6_pct", "6", "#74c0fc"),
+			("play_len_7plus_pct", "7+", "#ffd43b"),
+		], "Play Length Distribution",
+			"Fraction of plays by length. Shift from 1-card to longer = learning combos.")
+		plot_line(axes[0, 3], "avg_play_length", "Avg Play Length",
+			"Mean cards per play action. Higher = learning longer sequences instead of 1-card plays.", "#69db7c")
+
+		# Row 1: Play behavior + reward
+		ax_sq = axes[1, 0]
 		ax_sq.set_facecolor(PANEL)
 		if "scout_play_len" in trimmed:
-			ax_sq.plot(eval_iters[:len(trimmed["scout_play_len"])], trimmed["scout_play_len"],
+			ax_sq.plot(eval_iters[-len(trimmed["scout_play_len"]):], trimmed["scout_play_len"],
 					   color="#e0aaff", alpha=0.25, linewidth=0.8)
-			ax_sq.plot(eval_iters[:len(smoothed["scout_play_len"])], smoothed["scout_play_len"],
+			ax_sq.plot(eval_iters[-len(smoothed["scout_play_len"]):], smoothed["scout_play_len"],
 					   color="#e0aaff", linewidth=2)
 		_style_eval_ax(ax_sq, "Scout Play Length",
 			"Avg longest set/run containing scouted card after insertion. 1.0 = no play, 2.0 = pairs. Random ~1.5.")
-
-		# Row 1: Loss & entropy
-		plot_line(axes[1, 0], "policy_loss", "Policy Loss",
-			"PPO clipped surrogate loss. Watch for instability (spikes or divergence).", "#ff6b6b")
-		plot_line(axes[1, 1], "value_loss", "Value Loss",
-			"MSE between predicted and actual returns. Should decrease as value function improves.", "#ffa552")
-		plot_multi(axes[1, 2], [
-			("entropy_action_type", "Action Type", "#69db7c"),
-			("entropy_play_start", "Play Start", "#5dadec"),
-			("entropy_play_end", "Play End", "#ffa552"),
-			("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
-		], "Per-Head Entropy",
-			"Entropy per head (steps with 2+ options only). Collapsing = premature convergence. Compare to floors in config.")
-		plot_line(axes[1, 3], "entropy_floor_penalty", "Entropy Floor Penalty",
-			"Quadratic penalty when head entropy drops below floor. >0 = floor active. 0 = heads above floor.", "#ff922b")
-
-		# Row 2: PPO health
-		plot_line(axes[2, 0], "clip_fraction", "Clip Fraction",
-			"Fraction of samples clipped by PPO. <0.01 typical with masked multi-head actions.", "#ff922b")
-		plot_line(axes[2, 1], "approx_kl", "Approx KL Divergence",
-			"How far policy moved from collection policy. >0.05 = aggressive updates, risk of instability.", "#74c0fc")
-		plot_line(axes[2, 2], "explained_variance", "Explained Variance",
-			"How well value function predicts returns. ~0 = useless baseline, ~1 = perfect.", "#69db7c")
-		plot_line(axes[2, 3], "advantage_std", "Advantage Std (pre-norm)",
-			"Std of raw advantages before normalization. <0.01 = weak learning signal.", "#ffd43b")
-
-		# Row 3: Behavioral
-		plot_multi(axes[3, 0], [
+		plot_multi(axes[1, 1], [
 			("play_pct", "Play", "#69db7c"),
 			("scout_pct", "Scout", "#5dadec"),
 			("sns_pct", "S&S", "#ff6b6b"),
 		], "Action Type Distribution",
 			"Fraction of each action type. Shows how strategy evolves over training.",
 			ylim=(0, 1))
-		plot_line(axes[3, 1], "steps_per_game", "Steps Per Game",
-			"Average decisions per game. Shorter games may indicate more decisive play.", "#e0aaff")
-		plot_line(axes[3, 2], "avg_play_length", "Avg Play Length",
-			"Mean cards per play action. Higher = learning longer sequences instead of 1-card plays.", "#69db7c")
-		plot_line(axes[3, 3], "reward_std", "Reward Std",
+		plot_line(axes[1, 2], "reward", "Avg Reward (P0)",
+			"Mean per-round reward for the training player. Positive = winning more than losing.", "#5dadec")
+		plot_line(axes[1, 3], "reward_std", "Reward Std",
 			"Std of per-round rewards. High = noisy signal, low = consistent outcomes.", "#74c0fc")
+
+		# Row 2: Training losses + entropy
+		plot_line(axes[2, 0], "policy_loss", "Policy Loss",
+			"PPO clipped surrogate loss. Watch for instability (spikes or divergence).", "#ff6b6b")
+		plot_line(axes[2, 1], "value_loss", "Value Loss",
+			"MSE between predicted and actual returns. Should decrease as value function improves.", "#ffa552")
+		plot_multi(axes[2, 2], [
+			("entropy_action_type", "Action Type", "#69db7c"),
+			("entropy_play_start", "Play Start", "#5dadec"),
+			("entropy_play_end", "Play End", "#ffa552"),
+			("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
+		], "Per-Head Entropy",
+			"Entropy per head (steps with 2+ options only). Collapsing = premature convergence. Compare to floors in config.")
+		plot_line(axes[2, 3], "entropy_floor_penalty", "Entropy Floor Penalty",
+			"Quadratic penalty when head entropy drops below floor. >0 = floor active. 0 = heads above floor.", "#ff922b")
+
+		# Row 3: PPO diagnostics
+		plot_line(axes[3, 0], "value", "Value Prediction",
+			"Mean value function output. Should track reward. Divergence = value function miscalibrated.", "#e0aaff")
+		plot_line(axes[3, 1], "clip_fraction", "Clip Fraction",
+			"Fraction of samples clipped by PPO. <0.01 typical with masked multi-head actions.", "#ff922b")
+		plot_line(axes[3, 2], "approx_kl", "Approx KL Divergence",
+			"How far policy moved from collection policy. >0.05 = aggressive updates, risk of instability.", "#74c0fc")
+		plot_line(axes[3, 3], "explained_variance", "Explained Variance",
+			"How well value function predicts returns. ~0 = useless baseline, ~1 = perfect.", "#69db7c")
 
 		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
 						   hspace=0.40, wspace=0.25)
@@ -269,11 +290,17 @@ def _save_charts(metrics_history: dict, save_dir: str):
 	with open(summary_path, "w") as f:
 		f.write("\n".join(lines))
 
-def train(config: dict | None = None):
-	cfg = {**DEFAULT_CONFIG, **(config or {})}
+def train(config: dict | None = None, profile_iters: int | None = None):
+	cfg = {**PARAMS, **(config or {})}
 	save_dir = cfg["save_dir"]
 	os.makedirs(save_dir, exist_ok=True)
-	network = ScoutNetwork(input_size=INPUT_SIZE, layer_sizes=cfg["layer_sizes"])
+	ev = cfg.get("encoding_version", 1)
+	if ev == 2:
+		network = ScoutNetwork(INPUT_SIZE_V2, cfg["layer_sizes"],
+			play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
+			scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
+	else:
+		network = ScoutNetwork(input_size=INPUT_SIZE, layer_sizes=cfg["layer_sizes"])
 	optimizer = torch.optim.Adam(network.parameters(), lr=cfg["learning_rate"])
 	metrics_history = {
 		"iteration": [], "reward": [], "value": [],
@@ -283,9 +310,12 @@ def train(config: dict | None = None):
 		"entropy_play_end": [], "entropy_scout_insert": [],
 		"entropy_floor_penalty": [],
 		"play_pct": [], "scout_pct": [], "sns_pct": [],
-		"steps_per_game": [], "advantage_std": [],
+		"steps_per_game": [],
 		"avg_play_length": [], "reward_std": [],
-		"eval_iteration": [], "eval_margin": [],
+		"play_len_1_pct": [], "play_len_2_pct": [], "play_len_3_pct": [],
+		"play_len_4_pct": [], "play_len_5_pct": [], "play_len_6_pct": [],
+		"play_len_7plus_pct": [],
+		"eval_iteration": [],
 		"scout_play_len": [],
 	}
 	start_iter = 1
@@ -297,8 +327,12 @@ def train(config: dict | None = None):
 		optimizer.load_state_dict(checkpoint["optimizer_state"])
 		start_iter = checkpoint["iteration"] + 1
 		if "metrics_history" in checkpoint:
+			saved_metrics = checkpoint["metrics_history"]
+			# Migrate old eval_margin → eval_margin_random
+			if "eval_margin" in saved_metrics and "eval_margin_random" not in saved_metrics:
+				saved_metrics["eval_margin_random"] = saved_metrics.pop("eval_margin")
 			# Merge saved metrics, keeping new keys with empty defaults
-			for k, v in checkpoint["metrics_history"].items():
+			for k, v in saved_metrics.items():
 				metrics_history[k] = v
 		saved_cfg = checkpoint.get("config", {})
 		# Backward compat: convert old hidden_size/first_hidden_size to layer_sizes
@@ -307,7 +341,12 @@ def train(config: dict | None = None):
 				saved_cfg.get("first_hidden_size", 256),
 				saved_cfg["hidden_size"],
 			]
-		cfg = {**DEFAULT_CONFIG, **saved_cfg, **(config or {})}
+		# PARAMS overrides saved config; architecture params always come from checkpoint
+		cfg = {**saved_cfg, **PARAMS, **(config or {})}
+		if "layer_sizes" in saved_cfg:
+			cfg["layer_sizes"] = saved_cfg["layer_sizes"]
+		if "encoding_version" in saved_cfg:
+			cfg["encoding_version"] = saved_cfg["encoding_version"]
 		print(f"Resumed from iteration {start_iter - 1}")
 	pool = OpponentPool(max_size=cfg["opponent_pool_size"])
 	if os.path.exists(resume_path):
@@ -320,42 +359,55 @@ def train(config: dict | None = None):
 	# Load eval opponents
 	eval_opponents = {}
 	for name, path in cfg.get("eval_opponents", {}).items():
-		ckpt = torch.load(path, weights_only=False)
-		ckpt_cfg = ckpt.get("config", {})
-		if "layer_sizes" in ckpt_cfg:
-			ls = ckpt_cfg["layer_sizes"]
+		if path == "random":
+			eval_opponents[name] = RandomBot()
 		else:
-			ls = [ckpt_cfg.get("first_hidden_size", 256), ckpt_cfg.get("hidden_size", 128)]
-		eval_net = ScoutNetwork(layer_sizes=ls)
-		eval_net.load_state_dict(ckpt["model_state"])
-		eval_net.eval()
-		eval_opponents[name] = eval_net
+			ckpt = torch.load(path, weights_only=False)
+			ckpt_cfg = ckpt.get("config", {})
+			if "layer_sizes" in ckpt_cfg:
+				ls = ckpt_cfg["layer_sizes"]
+			else:
+				ls = [ckpt_cfg.get("first_hidden_size", 256), ckpt_cfg.get("hidden_size", 128)]
+			eval_ev = ckpt_cfg.get("encoding_version", 1)
+			if eval_ev == 2:
+				eval_net = ScoutNetwork(INPUT_SIZE_V2, ls,
+					play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
+					scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
+			else:
+				eval_net = ScoutNetwork(layer_sizes=ls)
+			eval_net.load_state_dict(ckpt["model_state"])
+			eval_net.eval()
+			eval_opponents[name] = eval_net
+			print(f"  Loaded eval opponent '{name}' from {path} (v{eval_ev})")
 		key = f"eval_margin_{name}"
 		if key not in metrics_history:
 			metrics_history[key] = []
-		print(f"  Loaded eval opponent '{name}' from {path}")
+	input_size = INPUT_SIZE_V2 if ev == 2 else INPUT_SIZE
 	print(f"Training Scout bot: {cfg['num_players']} players, "
-		  f"input_size={INPUT_SIZE}, layers={cfg['layer_sizes']}")
+		  f"input_size={input_size}, encoding=v{ev}, layers={cfg['layer_sizes']}")
 	print(f"Games/iter={cfg['games_per_iteration']}, "
 		  f"PPO epochs={cfg['ppo_epochs']}")
 	print(f"Output: {save_dir}/")
+	profiler = None
+	if profile_iters:
+		from pyinstrument import Profiler
+		profile_stop = start_iter + profile_iters
+		profiler = Profiler()
+		print(f"\nProfiling {profile_iters} iterations ({start_iter} to {profile_stop - 1})...")
+		profiler.start()
 	iteration = start_iter
 	try:
 		for iteration in range(start_iter, cfg["total_iterations"] + 1):
 			t0 = time.time()
-			# Self-play: collect games
+			# Self-play: collect games (batched forward passes)
 			network.eval()
-			iteration_records = []
-			for game_idx in range(cfg["games_per_iteration"]):
-				opponents = pool.sample(cfg["num_players"] - cfg["training_seats"]) or None
-				records = play_game(network, cfg["num_players"], opponent_pool=opponents,
-									training_seats=cfg["training_seats"],
-									reward_distribution=cfg.get("reward_distribution", "terminal"),
-									reward_mode=cfg.get("reward_mode", "game_score"),
-									shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
-				for r in records:
-					r.game_id = game_idx
-				iteration_records.extend(records)
+			iteration_records = play_games_batched(
+				network, cfg["games_per_iteration"], cfg["num_players"],
+				training_seats=cfg["training_seats"],
+				opponent_pool=pool.versions or None,
+				reward_distribution=cfg.get("reward_distribution", "terminal"),
+				reward_mode=cfg.get("reward_mode", "game_score"),
+				shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
 			play_time = time.time() - t0
 			# PPO training — on-policy, all steps from this iteration
 			network.train()
@@ -364,16 +416,17 @@ def train(config: dict | None = None):
 			# LR annealing: linear decay to 0
 			lr = cfg["learning_rate"] * (1 - iteration / cfg["total_iterations"])
 			optimizer.param_groups[0]["lr"] = lr
+			batch = prepare_ppo_batch(iteration_records, advantages, returns=returns)
 			ppo_sums = {}
 			for epoch in range(cfg["ppo_epochs"]):
 				m = ppo_update(
-					network, optimizer, iteration_records, advantages,
+					network, optimizer, batch,
 					clip_epsilon=cfg["clip_epsilon"],
 					entropy_bonus=cfg["entropy_bonus"],
 					value_loss_coeff=cfg["value_loss_coeff"],
-					returns=returns,
 					entropy_floors=cfg.get("entropy_floors"),
 					entropy_floor_coeff=cfg.get("entropy_floor_coeff", 1.0),
+					play_start_size=network.play_start_size,
 				)
 				# Epoch 0: ratios must be ~1.0 (policy hasn't changed yet)
 				if epoch == 0 and abs(m["mean_ratio"] - 1.0) > 0.01:
@@ -408,9 +461,13 @@ def train(config: dict | None = None):
 				scout_pct = n_scout / max(n_steps, 1)
 				sns_pct = n_sns / max(n_steps, 1)
 				steps_per_game = n_steps / cfg["games_per_iteration"]
-				adv_std = adv_std_val
 				play_lengths = [r.play_length for r in iteration_records if r.play_length is not None]
 				avg_play_length = sum(play_lengths) / max(len(play_lengths), 1)
+				n_plays = max(len(play_lengths), 1)
+				play_len_counts = [0] * 8 # indices 1-7, 0 unused
+				for l in play_lengths:
+					play_len_counts[min(l, 7)] += 1
+				play_len_pcts = [c / n_plays for c in play_len_counts]
 				metrics_history["iteration"].append(iteration)
 				metrics_history["reward"].append(avg_reward)
 				metrics_history["value"].append(avg_value)
@@ -424,8 +481,10 @@ def train(config: dict | None = None):
 				metrics_history["scout_pct"].append(scout_pct)
 				metrics_history["sns_pct"].append(sns_pct)
 				metrics_history["steps_per_game"].append(steps_per_game)
-				metrics_history["advantage_std"].append(adv_std)
 				metrics_history["avg_play_length"].append(avg_play_length)
+				for i in range(1, 7):
+					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
+				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
 				metrics_history["reward_std"].append(reward_std)
 				print(f"[iter {iteration:>5}] "
 					  f"reward={avg_reward:+.3f}  value={avg_value:+.3f}  "
@@ -435,7 +494,6 @@ def train(config: dict | None = None):
 					  f"steps={n_steps}  pool={len(pool.versions)}  "
 					  f"play={play_time:.1f}s  train={train_time:.1f}s")
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
-				_save_charts(metrics_history, save_dir)
 			# Periodic snapshots
 			if iteration % cfg["save_interval"] == 0:
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
@@ -448,26 +506,17 @@ def train(config: dict | None = None):
 						  training_seats=cfg["training_seats"])
 				log.save(os.path.join(save_dir, f"iter_{iteration}_game.json"))
 				print(f"  Saved snapshot + game log (iter {iteration})")
-			# Eval vs random + named opponents
+			# Eval vs all opponents
 			if iteration % cfg["eval_interval"] == 0:
 				network.eval()
 				n_eval = 40
-				total_margin = 0.0
-				for _ in range(n_eval):
-					nets = [network] + [RandomBot() for _ in range(cfg["num_players"] - 1)]
-					scores = play_eval_game(nets, cfg["num_players"])
-					# Compare vs mean opponent score (not max, which biases negative)
-					mean_opponent = sum(scores[1:]) / len(scores[1:])
-					total_margin += scores[0] - mean_opponent
-				avg_margin = total_margin / n_eval
 				metrics_history["eval_iteration"].append(iteration)
-				metrics_history["eval_margin"].append(avg_margin)
-				print(f"  Eval vs random: margin={avg_margin:+.1f}")
 				for name, eval_net in eval_opponents.items():
 					total_margin = 0.0
 					for _ in range(n_eval):
 						nets = [network] + [eval_net for _ in range(cfg["num_players"] - 1)]
 						scores = play_eval_game(nets, cfg["num_players"])
+						# Compare vs mean opponent score (not max, which biases negative)
 						mean_opponent = sum(scores[1:]) / len(scores[1:])
 						total_margin += scores[0] - mean_opponent
 					avg_margin = total_margin / n_eval
@@ -477,23 +526,34 @@ def train(config: dict | None = None):
 				scout_len, scout_n = eval_scout_quality(network, n_samples=200)
 				metrics_history["scout_play_len"].append(scout_len)
 				print(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
-				_save_charts(metrics_history, save_dir)
+				_save_charts(metrics_history, save_dir, set(eval_opponents))
+			# Profile exit
+			if profiler and iteration >= profile_stop - 1:
+				profiler.stop()
+				profile_path = os.path.join(save_dir, "profile.txt")
+				output = profiler.output_text(unicode=False, color=False)
+				print(f"\n{output}")
+				with open(profile_path, "w") as f:
+					f.write(output)
+				html_path = os.path.join(save_dir, "profile.html")
+				with open(html_path, "w") as f:
+					f.write(profiler.output_html())
+				print(f"Profile saved to {profile_path} and {html_path}")
+				return
 	except KeyboardInterrupt:
 		print(f"\nInterrupted at iteration {iteration}.")
+		if profiler:
+			profiler.stop()
+			print(profiler.output_text(unicode=False, color=False))
 		return
 	# Final save
 	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
-	_save_charts(metrics_history, save_dir)
+	_save_charts(metrics_history, save_dir, set(eval_opponents))
 	print(f"Training complete. Saved to {save_dir}/latest.pt")
 
 def main():
 	parser = argparse.ArgumentParser(description="Train a Scout card game bot")
 	parser.add_argument("--players", type=int, default=None, choices=[3, 4, 5])
-	parser.add_argument("--iterations", type=int, default=None)
-	parser.add_argument("--lr", type=float, default=None)
-	parser.add_argument("--batch-size", type=int, default=None)
-	parser.add_argument("--games-per-iter", type=int, default=None)
-	parser.add_argument("--entropy-bonus", type=float, default=None)
 	parser.add_argument("--save-dir", type=str, default=None)
 	parser.add_argument("--replay", type=str, default=None,
 		help="Path to a game log JSON file to replay")
@@ -501,6 +561,8 @@ def main():
 		help="Play agents against each other (e.g., random path/to/model.pt)")
 	parser.add_argument("--games", type=int, default=100,
 		help="Number of games for --match (default: 100)")
+	parser.add_argument("--profile", type=int, default=None, metavar="N",
+		help="Profile N training iterations with pyinstrument, then exit")
 	args = parser.parse_args()
 	if args.replay:
 		from game_log import GameLog, print_replay
@@ -518,14 +580,10 @@ def main():
 		return
 	config = {
 		"num_players": args.players,
-		"total_iterations": args.iterations,
-		"learning_rate": args.lr,
-		"batch_size": args.batch_size,
-		"games_per_iteration": args.games_per_iter,
-		"entropy_bonus": args.entropy_bonus,
 		"save_dir": args.save_dir,
 	}
-	train({k: v for k, v in config.items() if v is not None})
+	train({k: v for k, v in config.items() if v is not None},
+		  profile_iters=args.profile)
 
 if __name__ == "__main__":
 	main()

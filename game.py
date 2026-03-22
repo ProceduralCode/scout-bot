@@ -152,6 +152,10 @@ class Game:
 			self.round_ender = self.current_play_owner
 			self._end_round()
 			return
+		# If play was fully scouted but round didn't end, clean up
+		if self.current_play is None:
+			self.current_play_owner = None
+			self.scouts_since_play = 0
 		self._advance_turn()
 
 	def apply_sns_scout(self, left_end: bool, flip: bool, insert_pos: int):
@@ -163,6 +167,10 @@ class Game:
 		assert player.sns_available
 		player.sns_available = False
 		self._do_scout(left_end, flip, insert_pos)
+		# If play was fully scouted, clean up (apply_play will set new owner)
+		if self.current_play is None:
+			self.current_play_owner = None
+			self.scouts_since_play = 0
 		assert self._has_any_legal_play(), "S&S requires a legal play after scouting"
 		self.phase = Phase.SNS_PLAY
 
@@ -180,8 +188,9 @@ class Game:
 			self.current_play = Play.from_cards(play_cards)
 		else:
 			self.current_play = None
-			self.current_play_owner = None
-			self.scouts_since_play = 0
+			# Don't reset current_play_owner or scouts_since_play here —
+			# apply_scout needs them for the round-end check, and
+			# apply_play already resets both when a new play is made.
 
 	def _has_any_legal_play(self) -> bool:
 		hand = self.players[self.current_player].hand

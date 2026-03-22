@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 *.pt
 *.pth
+*.pyd
+fast_game.c
+build/
 runs/
 output/
+v*/

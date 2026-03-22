@@ -1,7 +1,10 @@
 import random
 import os
 import torch
-from encoding import INPUT_SIZE
+from encoding import (
+	INPUT_SIZE, INPUT_SIZE_V2,
+	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, SCOUT_INSERT_SIZE_V2,
+)
 from network import ScoutNetwork, RandomBot
 from training import play_eval_game
 
@@ -21,14 +24,17 @@ def load_agent(spec: str) -> Agent:
 			raise FileNotFoundError(f"Checkpoint not found: {spec}")
 		checkpoint = torch.load(spec, weights_only=False)
 		cfg = checkpoint.get("config", {})
+		ev = cfg.get("encoding_version", 1)
 		if "layer_sizes" in cfg:
-			network = ScoutNetwork(input_size=INPUT_SIZE, layer_sizes=cfg["layer_sizes"])
+			ls = cfg["layer_sizes"]
 		else:
-			network = ScoutNetwork(
-				input_size=INPUT_SIZE,
-				hidden_size=cfg.get("hidden_size", 128),
-				first_hidden_size=cfg.get("first_hidden_size", 256),
-			)
+			ls = [cfg.get("first_hidden_size", 256), cfg.get("hidden_size", 128)]
+		if ev == 2:
+			network = ScoutNetwork(INPUT_SIZE_V2, ls,
+				play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
+				scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
+		else:
+			network = ScoutNetwork(input_size=INPUT_SIZE, layer_sizes=ls)
 		network.load_state_dict(checkpoint["model_state"])
 		network.eval()
 		return Agent(os.path.basename(spec), network)

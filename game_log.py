@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from game import Card, Play, Game, Phase
-from display import format_card, format_hand, format_play, format_play_type
+from display import format_card, format_hand, format_play, format_play_type, format_showing_values
 
 @dataclass
 class GameEvent:
@@ -207,7 +207,7 @@ _COL_TBL = 20 # table
 _SEP = "  "
 
 def _hand_col_width(num_players: int) -> int:
-	return (45 // num_players + 2) * 3
+	return (45 // num_players + 2) * 2
 
 def _replay_header(num_players: int):
 	hw = _hand_col_width(num_players)
@@ -234,7 +234,7 @@ def _print_turn_event(ev: GameEvent, num_players: int):
 		action = ev.phase
 
 	if ev.hand_after:
-		hand_str = format_hand(ev.hand_after)
+		hand_str = format_showing_values(ev.hand_after)
 	elif ev.hand_after is not None:
 		hand_str = "(out)"
 	else:
@@ -305,9 +305,9 @@ def print_replay(log: GameLog):
 				for i in range(log.num_players):
 					flip_ev = flips.get(i)
 					if flip_ev and flip_ev.flip_decision and flip_ev.hand_after:
-						h = format_hand(flip_ev.hand_after)
+						h = format_showing_values(flip_ev.hand_after)
 					elif i in rs.hands:
-						h = format_hand(rs.hands[i])
+						h = format_showing_values(rs.hands[i])
 					else:
 						h = ""
 					hand_cols.append(h.ljust(hw))

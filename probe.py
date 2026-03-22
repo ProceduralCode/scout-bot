@@ -13,6 +13,7 @@ Usage: python probe.py [--iters N] [--games N] [--probe N]
 """
 import sys
 import random
+import numpy as np
 import torch
 import torch.nn.functional as F
 from game import Game
@@ -22,9 +23,11 @@ from encoding import (
 	decode_slot_to_hand_index, decode_action_type,
 	HAND_SLOTS, PLAY_SLOTS, PLAY_START_SIZE, PLAY_END_SIZE,
 	ACTION_TYPE_SIZE, SCOUT_INSERT_SIZE,
+	# V2
+	encode_state_v2, HAND_SLOTS_V2, SCOUT_INSERT_SIZE_V2,
 )
 from network import ScoutNetwork, masked_sample
-from training import StepRecord, compute_gae, ppo_update
+from training import StepRecord, compute_gae, prepare_ppo_batch, ppo_update
 
 NUM_PLAYERS = 4
 LAYER_SIZES = [64, 32]
@@ -96,23 +99,23 @@ def _sample_play(network, game, player=0, force_start_idx=None, force_end_to_sta
 		ps_logits = network.play_start_logits(hidden, action_type)
 		if force_start_idx is not None:
 			# Override mask to only allow the forced start
-			ps_mask = torch.zeros(PLAY_START_SIZE, dtype=torch.bool)
+			ps_mask = np.zeros(PLAY_START_SIZE, dtype=np.bool_)
 			ps_mask[(ho + force_start_idx) % HAND_SLOTS] = True
 		else:
 			ps_mask = get_play_start_mask(legal_plays, ho)
-		start_slot, _ = masked_sample(ps_logits, ps_mask)
+		start_slot, _ = masked_sample(ps_logits, torch.from_numpy(ps_mask))
 		start_idx = decode_slot_to_hand_index(start_slot, ho)
 
 		# Play end
 		pe_logits = network.play_end_logits(hidden, action_type, start_slot)
 		if force_end_to_start:
-			pe_mask = torch.zeros(PLAY_END_SIZE, dtype=torch.bool)
+			pe_mask = np.zeros(PLAY_END_SIZE, dtype=np.bool_)
 			pe_mask[start_slot] = True
 		else:
 			pe_mask = get_play_end_mask(legal_plays, start_idx, ho)
 		if not pe_mask.any():
 			return None
-		end_slot, _ = masked_sample(pe_logits, pe_mask)
+		end_slot, _ = masked_sample(pe_logits, torch.from_numpy(pe_mask))
 		end_idx = decode_slot_to_hand_index(end_slot, ho)
 
 	length = end_idx - start_idx + 1
@@ -158,13 +161,14 @@ def _train_iteration(network, optimizer, records, verbose=False,
 		mean_r = sum(rewards) / len(rewards)
 		print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}  "
 			  f"returns_range=[{min(returns):.3f}, {max(returns):.3f}]")
+	batch = prepare_ppo_batch(records, advantages, returns=returns)
 	ppo_sums = {}
 	for _ in range(PPO_EPOCHS):
 		network.train()
 		m = ppo_update(
-			network, optimizer, records, advantages,
+			network, optimizer, batch,
 			clip_epsilon=CLIP_EPSILON, entropy_bonus=ENTROPY_BONUS,
-			value_loss_coeff=VALUE_LOSS_COEFF, returns=returns,
+			value_loss_coeff=VALUE_LOSS_COEFF,
 			entropy_floors=entropy_floors,
 			entropy_floor_coeff=entropy_floor_coeff,
 		)
@@ -520,27 +524,33 @@ def _sample_scout(network, game, player=1):
 		return None
 	card = play_cards[0]  # left end, no flip
 	action_type = 1  # scout-left-normal
-
-	state, ho, po = _encode(game, player)
+	ev = getattr(network, 'encoding_version', 1)
+	if ev == 2:
+		_hs = HAND_SLOTS_V2
+		_sis = SCOUT_INSERT_SIZE_V2
+		ho = random.randint(0, _hs - 1)
+		state = encode_state_v2(game, player, ho)
+	else:
+		_hs = HAND_SLOTS
+		_sis = SCOUT_INSERT_SIZE
+		state, ho, po = _encode(game, player)
 	with torch.no_grad():
 		hidden = network(state)
 		value = network.value(hidden).item()
-
 		at_logits = network.action_type_logits(hidden)
 		legal_plays = get_legal_plays(hand, game.current_play)
-		at_mask = get_action_type_mask(game, legal_plays)
-
+		at_mask = get_action_type_mask(game, legal_plays, max_hand=_hs)
 		si_logits = network.scout_insert_logits(hidden, action_type)
-		si_mask = get_scout_insert_mask(game, ho)
+		si_mask = get_scout_insert_mask(game, ho, num_slots=_sis)
 		if not si_mask.any():
 			return None
-		insert_slot, _ = masked_sample(si_logits, si_mask)
-		insert_pos = (insert_slot - ho) % SCOUT_INSERT_SIZE
-
+		insert_slot, _ = masked_sample(si_logits, torch.from_numpy(si_mask))
+		insert_pos = (insert_slot - ho) % _sis
 	return {
 		"state": state, "value": value,
 		"at_logits": at_logits, "at_mask": at_mask, "action_type": action_type,
-		"si_logits": si_logits, "si_mask": si_mask, "insert_pos": insert_pos,
+		"si_logits": si_logits, "si_mask": si_mask,
+		"insert_slot": insert_slot, "insert_pos": insert_pos,
 		"card": card, "hand": list(hand),
 	}
 
@@ -551,7 +561,7 @@ def _make_scout_record(sample, reward, game_id):
 		action_type=sample["action_type"],
 		action_type_logits=sample["at_logits"],
 		action_type_mask=sample["at_mask"],
-		scout_insert=sample["insert_pos"],
+		scout_insert=sample["insert_slot"],
 		scout_insert_logits=sample["si_logits"],
 		scout_insert_mask=sample["si_mask"],
 		value=sample["value"],
@@ -614,7 +624,7 @@ def probe_scout_insert(n_iters=100, n_games=50):
 			if sample is None:
 				continue
 			# Lock action_type mask to only allow scout — no gradient noise from at head
-			forced_at_mask = torch.zeros(ACTION_TYPE_SIZE, dtype=torch.bool)
+			forced_at_mask = np.zeros(ACTION_TYPE_SIZE, dtype=np.bool_)
 			forced_at_mask[sample["action_type"]] = True
 			sample["at_mask"] = forced_at_mask
 			# Continuous reward based on quality relative to best/worst
@@ -697,7 +707,7 @@ def probe_scout_adjacent(n_iters=100, n_games=50):
 			if not _has_any_match(sample["hand"], sample["card"]):
 				continue
 			# Lock action_type mask
-			forced_at_mask = torch.zeros(ACTION_TYPE_SIZE, dtype=torch.bool)
+			forced_at_mask = np.zeros(ACTION_TYPE_SIZE, dtype=np.bool_)
 			forced_at_mask[sample["action_type"]] = True
 			sample["at_mask"] = forced_at_mask
 			adj = _is_adjacent_match(sample["hand"], sample["card"], sample["insert_pos"])
@@ -733,7 +743,7 @@ def _sample_action_type(network, game, player=1):
 		at_mask = get_action_type_mask(game, legal_plays)
 		if not at_mask.any():
 			return None
-		action_type, _ = masked_sample(at_logits, at_mask)
+		action_type, _ = masked_sample(at_logits, torch.from_numpy(at_mask))
 
 	action_info = decode_action_type(action_type)
 	return {
@@ -890,6 +900,176 @@ def probe_gae_multistep(n_iters=100, n_games=50):
 		  f"avg_terminal={avg_terminal:.2f}  (target: error decreases)")
 	return passed
 
+def probe_frozen_trunk_scout(n_iters=100, n_games=50):
+	"""Probe 8: Load trained v3_4 checkpoint, freeze shared trunk, train only scout_insert_head.
+	Tests whether the trained trunk's features support scout insertion learning.
+	If this passes: the trunk has useful features but the scout signal is too weak in full training.
+	If this fails: the trunk doesn't encode what the scout head needs."""
+	import os
+	# Try both relative paths (from scout-bot/ and from workspace root)
+	ckpt_path = os.path.join("v3_4", "latest.pt")
+	if not os.path.exists(ckpt_path):
+		ckpt_path = os.path.join("scout-bot", "v3_4", "latest.pt")
+	if not os.path.exists(ckpt_path):
+		print(f"  Probe 8 (frozen trunk):      SKIP  (no checkpoint at {ckpt_path})")
+		return False
+
+	checkpoint = torch.load(ckpt_path, weights_only=False)
+	ckpt_cfg = checkpoint.get("config", {})
+	layer_sizes = ckpt_cfg.get("layer_sizes", [256, 128])
+
+	network = ScoutNetwork(layer_sizes=layer_sizes)
+	network.load_state_dict(checkpoint["model_state"])
+
+	# Freeze shared trunk — only train scout_insert_head
+	for param in network.shared.parameters():
+		param.requires_grad = False
+	for param in network.value_head.parameters():
+		param.requires_grad = False
+	for param in network.action_type_head.parameters():
+		param.requires_grad = False
+	for param in network.play_start_head.parameters():
+		param.requires_grad = False
+	for param in network.play_end_head.parameters():
+		param.requires_grad = False
+	# Reinitialize scout_insert_head to test learning from scratch
+	torch.nn.init.xavier_uniform_(network.scout_insert_head.weight)
+	torch.nn.init.zeros_(network.scout_insert_head.bias)
+
+	# Only optimize the scout head
+	optimizer = torch.optim.Adam(network.scout_insert_head.parameters(), lr=LR)
+
+	def _eval_adj_rate(network, n_samples=500):
+		"""Measure P(adjacent_match) over scoutable states with a match available."""
+		n_adj, n_total = 0, 0
+		for _ in range(n_samples):
+			game = _mid_round_state()
+			if game is None:
+				continue
+			sample = _sample_scout(network, game)
+			if sample is None:
+				continue
+			hand = sample["hand"]
+			card = sample["card"]
+			if not any(c[0] == card[0] for c in hand):
+				continue
+			n_total += 1
+			pos = sample["insert_pos"]
+			val = card[0]
+			if (pos > 0 and hand[pos - 1][0] == val) or (pos < len(hand) and hand[pos][0] == val):
+				n_adj += 1
+		return n_adj / max(n_total, 1)
+
+	# Measure initial quality with trained trunk + fresh head
+	network.eval()
+	init_rate = _eval_adj_rate(network)
+
+	# Train
+	for it in range(n_iters):
+		network.eval()
+		records = []
+		for g in range(n_games):
+			game = _mid_round_state()
+			if game is None:
+				continue
+			sample = _sample_scout(network, game)
+			if sample is None:
+				continue
+			if not any(c[0] == sample["card"][0] for c in sample["hand"]):
+				continue
+			forced_at_mask = np.zeros(ACTION_TYPE_SIZE, dtype=np.bool_)
+			forced_at_mask[sample["action_type"]] = True
+			sample["at_mask"] = forced_at_mask
+			pos = sample["insert_pos"]
+			val = sample["card"][0]
+			hand = sample["hand"]
+			adj = ((pos > 0 and hand[pos - 1][0] == val)
+				   or (pos < len(hand) and hand[pos][0] == val))
+			reward = 1.0 if adj else -1.0
+			records.append(_make_scout_record(sample, reward=reward, game_id=g))
+		if records:
+			verbose = (it < 3 or it == n_iters - 1)
+			if verbose:
+				print(f"  [8 iter {it}]")
+			# Use _train_iteration but with our optimizer
+			advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+			if verbose:
+				rewards = [r.reward for r in records]
+				mean_r = sum(rewards) / len(rewards)
+				print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}")
+			batch = prepare_ppo_batch(records, advantages, returns=returns)
+			for _ in range(PPO_EPOCHS):
+				network.train()
+				# Forward through frozen trunk + trainable head
+				ppo_update(
+					network, optimizer, batch,
+					clip_epsilon=CLIP_EPSILON, entropy_bonus=ENTROPY_BONUS,
+					value_loss_coeff=0.0,  # don't train frozen value head
+					entropy_floors=ENTROPY_FLOORS,
+					entropy_floor_coeff=ENTROPY_FLOOR_COEFF,
+				)
+
+	# Measure final
+	network.eval()
+	final_rate = _eval_adj_rate(network)
+
+	passed = final_rate > init_rate + 0.05
+	status = "PASS" if passed else "FAIL"
+	print(f"  Probe 8 (frozen trunk):      {status}  P(adj_match) {init_rate:.3f} -> {final_rate:.3f}  (target: improvement)")
+	return passed
+
+def probe_trivial_scout(n_iters=100, n_games=50):
+	"""Probe 9: Can the scout head learn to always insert at position 0?
+	Trivially easy control test — if this fails, the training mechanics are broken."""
+	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
+
+	def _eval_pos0_rate(network, n_samples=500):
+		n_pos0, n_total = 0, 0
+		for _ in range(n_samples):
+			game = _mid_round_state()
+			if game is None:
+				continue
+			sample = _sample_scout(network, game)
+			if sample is None:
+				continue
+			n_total += 1
+			if sample["insert_pos"] == 0:
+				n_pos0 += 1
+		return n_pos0 / max(n_total, 1)
+
+	network.eval()
+	init_rate = _eval_pos0_rate(network)
+
+	for it in range(n_iters):
+		network.eval()
+		records = []
+		for g in range(n_games):
+			game = _mid_round_state()
+			if game is None:
+				continue
+			sample = _sample_scout(network, game)
+			if sample is None:
+				continue
+			forced_at_mask = np.zeros(ACTION_TYPE_SIZE, dtype=np.bool_)
+			forced_at_mask[sample["action_type"]] = True
+			sample["at_mask"] = forced_at_mask
+			reward = 1.0 if sample["insert_pos"] == 0 else -1.0
+			records.append(_make_scout_record(sample, reward=reward, game_id=g))
+		if records:
+			verbose = (it < 3 or it == n_iters - 1)
+			if verbose:
+				print(f"  [9 iter {it}]")
+			_train_iteration(network, optimizer, records, verbose=verbose)
+
+	network.eval()
+	final_rate = _eval_pos0_rate(network)
+
+	passed = final_rate > init_rate + 0.1
+	status = "PASS" if passed else "FAIL"
+	print(f"  Probe 9 (trivial pos=0):     {status}  P(pos=0) {init_rate:.3f} -> {final_rate:.3f}  (target: improvement)")
+	return passed
+
 # --- Main ---
 
 ALL_PROBES = {
@@ -901,6 +1081,8 @@ ALL_PROBES = {
 	55: ("scout_adjacent", probe_scout_adjacent),
 	6: ("action_type", probe_action_type),
 	7: ("gae_multistep", probe_gae_multistep),
+	8: ("frozen_trunk_scout", probe_frozen_trunk_scout),
+	9: ("trivial_scout", probe_trivial_scout),
 }
 
 def main():

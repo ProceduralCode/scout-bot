@@ -3,16 +3,16 @@ from game import Card, Play, PlayType
 
 # 0 represents 10 in the compact notation
 def _val_to_char(v: int) -> str:
-	return "0" if v == 10 else str(v)
+	return "T" if v == 10 else str(v)
 
 def _char_to_val(c: str) -> int:
-	return 10 if c == "0" else int(c)
+	return 10 if c in ("0", "T") else int(c)
 
 def parse_card(s: str) -> Card:
 	"""Parse compact notation to a Card. "37" -> (3, 7), "05" -> (10, 5)."""
 	s = s.strip()
-	if len(s) != 2 or not s.isdigit():
-		raise ValueError(f"Invalid card: {s!r} (expected 2 digits, 0=10)")
+	if len(s) != 2 or not all(c.isdigit() or c == "T" for c in s):
+		raise ValueError(f"Invalid card: {s!r} (expected 2 chars, t=10)")
 	return (_char_to_val(s[0]), _char_to_val(s[1]))
 
 def format_card(card: Card) -> str:

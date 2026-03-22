@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from game import Game, Play, PlayType, Phase
 
@@ -28,6 +29,34 @@ ACTION_TYPE_SIZE = 9
 PLAY_START_SIZE = 20
 PLAY_END_SIZE = 20
 SCOUT_INSERT_SIZE = 21
+
+# V2 encoding: smaller hand, compact play, trimmed metadata
+HAND_SLOTS_V2 = 15
+HAND_SIZE_V2 = HAND_SLOTS_V2 * CARD_VALUES  # 165
+# Compact play: end cards (4 one-hots) + type + strength + length
+PLAY_CARDS_V2 = 4 * CARD_VALUES  # 44
+PLAY_TYPE_V2 = 3   # no_play / set / run
+PLAY_STRENGTH_V2 = 10  # values 1-10
+PLAY_LENGTH_V2 = 10    # lengths 1-10
+PLAY_SIZE_V2 = PLAY_CARDS_V2 + PLAY_TYPE_V2 + PLAY_STRENGTH_V2 + PLAY_LENGTH_V2  # 67
+# Metadata v2 breakdown:
+#   1  your hand size (/15)
+#   4  opponent hand sizes (/15), zero-padded
+#   1  your collected count (/15)
+#   4  opponent collected counts (/15), zero-padded
+#   1  your scout tokens (/5)
+#   4  opponent scout tokens (/5), zero-padded
+#   1  your S&S availability
+#   4  opponent S&S availability, zero-padded
+#   3  player count one-hot (3/4/5)
+#   1  scouts since play, normalized
+#   5  play owner relative position one-hot (0=self, 1-4 seats away)
+# Total: 29
+METADATA_SIZE_V2 = 29
+INPUT_SIZE_V2 = HAND_SIZE_V2 + PLAY_SIZE_V2 + METADATA_SIZE_V2  # 261
+PLAY_START_SIZE_V2 = 15
+PLAY_END_SIZE_V2 = 15
+SCOUT_INSERT_SIZE_V2 = 15  # == HAND_SLOTS_V2, no more 20/21 mismatch
 
 # Action type index layout:
 # 0: Play
@@ -169,141 +198,192 @@ def _sns_variant_legal(hand: list, play_cards: list, left_end: bool, flip: bool)
 	return False
 
 # --- Encoding functions ---
+# Write directly into numpy buffers to avoid Python list building and
+# torch.tensor(list) overhead. torch.from_numpy() is near-free (shared memory).
 
-def _encode_hand(hand: list, hand_offset: int) -> list[float]:
-	"""Encode hand into HAND_SLOTS one-hot slots with given offset."""
-	buf = [0.0] * HAND_SIZE
-	# Fill empty slots with the "empty" one-hot (index 0 = 1.0)
-	for i in range(HAND_SLOTS):
-		buf[i * CARD_VALUES] = 1.0
-	# Place hand cards at offset
+def _fill_hand(buf, offset, hand, hand_offset, num_slots=HAND_SLOTS):
+	"""Write hand encoding into buf[offset:offset+num_slots*CARD_VALUES]."""
+	for i in range(num_slots):
+		buf[offset + i * CARD_VALUES] = 1.0
 	for i, card in enumerate(hand):
-		slot = (hand_offset + i) % HAND_SLOTS
-		pos = slot * CARD_VALUES
+		slot = (hand_offset + i) % num_slots
+		pos = offset + slot * CARD_VALUES
 		buf[pos] = 0.0
 		buf[pos + card[0]] = 1.0
-	return buf
 
-def _encode_play(current_play: list | None, play_offset: int) -> list[float]:
-	"""Encode the current play (both sides of each card) into PLAY_SLOTS slots with given offset."""
-	buf = [0.0] * PLAY_SIZE
-	# Fill empty slots with the "empty" one-hot (index 0 = 1.0 for each side)
+def _fill_play(buf, offset, current_play, play_offset):
+	"""Write play encoding into buf[offset:offset+PLAY_SIZE]."""
 	for i in range(PLAY_SLOTS):
-		pos = i * CARD_VALUES * 2
+		pos = offset + i * CARD_VALUES * 2
 		buf[pos] = 1.0
 		buf[pos + CARD_VALUES] = 1.0
 	if current_play is None:
-		return buf
-	for i, (side_a, side_b) in enumerate(current_play):
+		return
+	for i, (side_a, side_b) in enumerate(current_play.cards):
 		if i >= PLAY_SLOTS:
 			break
 		slot = (play_offset + i) % PLAY_SLOTS
-		pos = slot * CARD_VALUES * 2
+		pos = offset + slot * CARD_VALUES * 2
 		buf[pos] = 0.0
 		buf[pos + side_a] = 1.0
 		buf[pos + CARD_VALUES] = 0.0
 		buf[pos + CARD_VALUES + side_b] = 1.0
-	return buf
 
-def _encode_metadata(state: dict) -> list[float]:
-	"""Encode metadata into a flat list of floats."""
-	num_players = state["num_players"]
-	scores = state["scores"]
-	hand_sizes = state["hand_sizes"]
-	collected_counts = state["collected_counts"]
-	scout_tokens = state["scout_tokens"]
-	sns_available = state["sns_available"]
-	max_opponents = 4
-	buf = []
-	# Your score (you are always index 0 in the rotated state)
-	buf.append(scores[0] / 20.0)
-	# Opponent scores, zero-padded to 4
-	for i in range(max_opponents):
-		if i + 1 < num_players:
-			buf.append(scores[i + 1] / 20.0)
-		else:
-			buf.append(0.0)
-	# Your hand size
-	buf.append(hand_sizes[0] / 15.0)
-	# Opponent hand sizes, zero-padded to 4
-	for i in range(max_opponents):
-		if i + 1 < num_players:
-			buf.append(hand_sizes[i + 1] / 15.0)
-		else:
-			buf.append(0.0)
-	# Your collected count
-	buf.append(collected_counts[0] / 20.0)
-	# Opponent collected counts, zero-padded to 4
-	for i in range(max_opponents):
-		if i + 1 < num_players:
-			buf.append(collected_counts[i + 1] / 20.0)
-		else:
-			buf.append(0.0)
-	# Your scout tokens
-	buf.append(scout_tokens[0] / 5.0)
-	# Opponent scout tokens, zero-padded to 4
-	for i in range(max_opponents):
-		if i + 1 < num_players:
-			buf.append(scout_tokens[i + 1] / 5.0)
-		else:
-			buf.append(0.0)
-	# Your S&S availability
-	buf.append(1.0 if sns_available[0] else 0.0)
-	# Opponent S&S availability, zero-padded to 4
-	for i in range(max_opponents):
-		if i + 1 < num_players:
-			buf.append(1.0 if sns_available[i + 1] else 0.0)
-		else:
-			buf.append(0.0)
-	# Player count one-hot (3/4/5)
-	for n in (3, 4, 5):
-		buf.append(1.0 if num_players == n else 0.0)
-	# Scouts since current play, normalized by (num_players - 1)
-	denom = max(num_players - 1, 1)
-	buf.append(state["scouts_since_play"] / denom)
+def _fill_metadata(buf, offset, game, player):
+	"""Write metadata into buf[offset:offset+METADATA_SIZE].
+	Reads directly from game state, skipping intermediate dict creation."""
+	n = game.num_players
+	players = game.players
+	i = offset
+	buf[i] = game.cumulative_scores[player] / 20.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = game.cumulative_scores[(player + 1 + j) % n] / 20.0
+		i += 1
+	buf[i] = len(players[player].hand) / 15.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].hand) / 15.0
+		i += 1
+	buf[i] = len(players[player].collected) / 20.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].collected) / 20.0
+		i += 1
+	buf[i] = players[player].scout_tokens / 5.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = players[(player + 1 + j) % n].scout_tokens / 5.0
+		i += 1
+	buf[i] = 1.0 if players[player].sns_available else 0.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = 1.0 if players[(player + 1 + j) % n].sns_available else 0.0
+		i += 1
+	for pc in (3, 4, 5):
+		buf[i] = 1.0 if n == pc else 0.0; i += 1
+	# Scouts since play, normalized
+	buf[i] = game.scouts_since_play / max(n - 1, 1); i += 1
 	# Play owner relative position one-hot (5 slots: 0=self, 1-4 seats away)
-	owner_pos = state["play_owner_relative_pos"]
+	owner_rel = (game.current_play_owner - player) % n if game.current_play_owner is not None else None
 	for dist in range(5):
-		buf.append(1.0 if owner_pos == dist else 0.0)
+		buf[i] = 1.0 if owner_rel == dist else 0.0; i += 1
 	# Round progress
-	total = state["total_rounds"]
-	buf.append(state["round_number"] / total if total > 0 else 0.0)
-	return buf
+	buf[i] = game.round_number / game.total_rounds if game.total_rounds > 0 else 0.0
 
-def encode_state(game: Game, player: int, hand_offset: int, play_offset: int) -> torch.Tensor:
+def _fill_play_v2(buf, offset, current_play):
+	"""Write compact play encoding: 4 card one-hots + type + strength + length.
+	No rotation — end cards at fixed positions so the network can read them."""
+	# Initialize all 4 card slots to empty (value 0)
+	for i in range(4):
+		buf[offset + i * CARD_VALUES] = 1.0
+	type_off = offset + PLAY_CARDS_V2
+	if current_play is None:
+		buf[type_off] = 1.0  # no_play
+		return
+	cards = current_play.cards
+	# Left end card (both faces)
+	left = cards[0]
+	buf[offset] = 0.0
+	buf[offset + left[0]] = 1.0
+	buf[offset + CARD_VALUES] = 0.0
+	buf[offset + CARD_VALUES + left[1]] = 1.0
+	# Right end card (both faces), empty if single-card play
+	if len(cards) > 1:
+		right = cards[-1]
+		buf[offset + 2 * CARD_VALUES] = 0.0
+		buf[offset + 2 * CARD_VALUES + right[0]] = 1.0
+		buf[offset + 3 * CARD_VALUES] = 0.0
+		buf[offset + 3 * CARD_VALUES + right[1]] = 1.0
+	# Play type: 0=no_play, 1=set, 2=run
+	if current_play.play_type == PlayType.SET:
+		buf[type_off + 1] = 1.0
+	else:
+		buf[type_off + 2] = 1.0
+	# Strength: high card for runs, repeated value for sets (index 0-9 for values 1-10)
+	buf[type_off + PLAY_TYPE_V2 + current_play.strength - 1] = 1.0
+	# Length (index 0-9 for lengths 1-10)
+	buf[type_off + PLAY_TYPE_V2 + PLAY_STRENGTH_V2 + current_play.count - 1] = 1.0
+
+def _fill_metadata_v2(buf, offset, game, player):
+	"""Write v2 metadata: no cumulative scores or round progress.
+	Collected counts normalized /15 instead of /20."""
+	n = game.num_players
+	players = game.players
+	i = offset
+	buf[i] = len(players[player].hand) / 15.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].hand) / 15.0
+		i += 1
+	buf[i] = len(players[player].collected) / 15.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].collected) / 15.0
+		i += 1
+	buf[i] = players[player].scout_tokens / 5.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = players[(player + 1 + j) % n].scout_tokens / 5.0
+		i += 1
+	buf[i] = 1.0 if players[player].sns_available else 0.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = 1.0 if players[(player + 1 + j) % n].sns_available else 0.0
+		i += 1
+	for pc in (3, 4, 5):
+		buf[i] = 1.0 if n == pc else 0.0; i += 1
+	buf[i] = game.scouts_since_play / max(n - 1, 1); i += 1
+	owner_rel = (game.current_play_owner - player) % n if game.current_play_owner is not None else None
+	for dist in range(5):
+		buf[i] = 1.0 if owner_rel == dist else 0.0; i += 1
+
+def encode_state_v2(game, player, hand_offset):
+	"""V2 state encoding: compact play (no rotation), smaller hand."""
+	buf = np.zeros(INPUT_SIZE_V2, dtype=np.float32)
+	_fill_hand(buf, 0, game.players[player].hand, hand_offset, HAND_SLOTS_V2)
+	_fill_play_v2(buf, HAND_SIZE_V2, game.current_play)
+	_fill_metadata_v2(buf, HAND_SIZE_V2 + PLAY_SIZE_V2, game, player)
+	return torch.from_numpy(buf)
+
+def encode_hand_both_orientations_v2(game, player, hand_offset):
+	"""V2 flip decision encoding: both hand orientations."""
+	buf = np.zeros(INPUT_SIZE_V2, dtype=np.float32)
+	hand = game.players[player].hand
+	_fill_hand(buf, 0, hand, hand_offset, HAND_SLOTS_V2)
+	_fill_play_v2(buf, HAND_SIZE_V2, game.current_play)
+	_fill_metadata_v2(buf, HAND_SIZE_V2 + PLAY_SIZE_V2, game, player)
+	buf_flip = buf.copy()
+	buf_flip[:HAND_SIZE_V2] = 0.0
+	_fill_hand(buf_flip, 0, [(b, a) for a, b in hand], hand_offset, HAND_SLOTS_V2)
+	return torch.from_numpy(buf), torch.from_numpy(buf_flip)
+
+def encode_state(game, player, hand_offset, play_offset):
 	"""Convert game state to a 1D float input tensor."""
-	state = game.get_state_for_player(player)
-	buf = []
-	buf.extend(_encode_hand(state["hand"], hand_offset))
-	buf.extend(_encode_play(state["current_play"], play_offset))
-	buf.extend(_encode_metadata(state))
-	return torch.tensor(buf, dtype=torch.float32)
+	buf = np.zeros(INPUT_SIZE, dtype=np.float32)
+	_fill_hand(buf, 0, game.players[player].hand, hand_offset)
+	_fill_play(buf, HAND_SIZE, game.current_play, play_offset)
+	_fill_metadata(buf, HAND_SIZE + PLAY_SIZE, game, player)
+	return torch.from_numpy(buf)
 
-def encode_hand_both_orientations(game: Game, player: int, hand_offset: int, play_offset: int) -> tuple[torch.Tensor, torch.Tensor]:
+def encode_hand_both_orientations(game, player, hand_offset, play_offset):
 	"""Return state tensors for both hand orientations (for flip decision)."""
-	state = game.get_state_for_player(player)
-	hand = state["hand"]
-	# Normal orientation
-	buf_normal = []
-	buf_normal.extend(_encode_hand(hand, hand_offset))
-	buf_normal.extend(_encode_play(state["current_play"], play_offset))
-	buf_normal.extend(_encode_metadata(state))
-	# Flipped orientation: swap showing/hidden values
-	flipped_hand = [(hidden, showing) for showing, hidden in hand]
-	buf_flipped = []
-	buf_flipped.extend(_encode_hand(flipped_hand, hand_offset))
-	buf_flipped.extend(_encode_play(state["current_play"], play_offset))
-	buf_flipped.extend(_encode_metadata(state))
-	return (
-		torch.tensor(buf_normal, dtype=torch.float32),
-		torch.tensor(buf_flipped, dtype=torch.float32),
-	)
+	buf = np.zeros(INPUT_SIZE, dtype=np.float32)
+	hand = game.players[player].hand
+	_fill_hand(buf, 0, hand, hand_offset)
+	_fill_play(buf, HAND_SIZE, game.current_play, play_offset)
+	_fill_metadata(buf, HAND_SIZE + PLAY_SIZE, game, player)
+	# Copy and overwrite hand portion for flipped orientation
+	buf_flip = buf.copy()
+	buf_flip[:HAND_SIZE] = 0.0
+	_fill_hand(buf_flip, 0, [(b, a) for a, b in hand], hand_offset)
+	return torch.from_numpy(buf), torch.from_numpy(buf_flip)
 
 # --- Mask functions ---
 
-def get_action_type_mask(game: Game, legal_plays: list[tuple[int, int]]) -> torch.Tensor:
+def get_action_type_mask(game: Game, legal_plays: list[tuple[int, int]], max_hand: int = HAND_SLOTS) -> np.ndarray:
 	"""Return a boolean mask of shape [9] where True = legal action type."""
-	mask = torch.zeros(ACTION_TYPE_SIZE, dtype=torch.bool)
+	mask = np.zeros(ACTION_TYPE_SIZE, dtype=np.bool_)
 	player = game.players[game.current_player]
 	hand = player.hand
 	has_play = game.current_play is not None
@@ -317,7 +397,7 @@ def get_action_type_mask(game: Game, legal_plays: list[tuple[int, int]]) -> torc
 		mask[0] = True
 
 	# Scout/S&S only if there's a table play and hand has room
-	if has_play and len(hand) < HAND_SLOTS:
+	if has_play and len(hand) < max_hand:
 		play_cards = game.current_play.cards
 		# Scout: always legal if there's a play to scout from
 		mask[1] = True  # left normal
@@ -340,39 +420,39 @@ def get_action_type_mask(game: Game, legal_plays: list[tuple[int, int]]) -> torc
 
 	return mask
 
-def get_play_start_mask(legal_plays: list[tuple[int, int]], hand_offset: int) -> torch.Tensor:
-	"""Return a boolean mask of shape [20] for legal play start positions.
+def get_play_start_mask(legal_plays: list[tuple[int, int]], hand_offset: int, num_slots: int = HAND_SLOTS) -> np.ndarray:
+	"""Return a boolean mask for legal play start positions.
 	Positions correspond to encoded hand slots (with hand_offset applied)."""
-	mask = torch.zeros(PLAY_START_SIZE, dtype=torch.bool)
+	mask = np.zeros(num_slots, dtype=np.bool_)
 	for start, end in legal_plays:
-		slot = (hand_offset + start) % HAND_SLOTS
+		slot = (hand_offset + start) % num_slots
 		mask[slot] = True
 	return mask
 
-def get_play_end_mask(legal_plays: list[tuple[int, int]], start: int, hand_offset: int) -> torch.Tensor:
-	"""Return a boolean mask of shape [20] for legal play end positions.
+def get_play_end_mask(legal_plays: list[tuple[int, int]], start: int, hand_offset: int, num_slots: int = HAND_SLOTS) -> np.ndarray:
+	"""Return a boolean mask for legal play end positions.
 	Args:
 		start: The raw hand index (before offset) of the play start.
 	"""
-	mask = torch.zeros(PLAY_END_SIZE, dtype=torch.bool)
+	mask = np.zeros(num_slots, dtype=np.bool_)
 	for s, end in legal_plays:
 		if s == start:
-			slot = (hand_offset + end) % HAND_SLOTS
+			slot = (hand_offset + end) % num_slots
 			mask[slot] = True
 	return mask
 
-def get_scout_insert_mask(game: Game, hand_offset: int) -> torch.Tensor:
-	"""Return a boolean mask of shape [21] for legal scout insert positions.
+def get_scout_insert_mask(game: Game, hand_offset: int, num_slots: int = SCOUT_INSERT_SIZE) -> np.ndarray:
+	"""Return a boolean mask for legal scout insert positions.
 	Positions correspond to encoded hand slots (with hand_offset applied)."""
 	hand_len = len(game.players[game.current_player].hand)
-	mask = torch.zeros(SCOUT_INSERT_SIZE, dtype=torch.bool)
-	for pos in range(min(hand_len + 1, SCOUT_INSERT_SIZE)):
-		slot = (hand_offset + pos) % SCOUT_INSERT_SIZE
+	mask = np.zeros(num_slots, dtype=np.bool_)
+	for pos in range(min(hand_len + 1, num_slots)):
+		slot = (hand_offset + pos) % num_slots
 		mask[slot] = True
 	return mask
 
-def get_sns_insert_mask(game: Game, left_end: bool, flip: bool, hand_offset: int) -> torch.Tensor:
-	"""Return a boolean mask of shape [21] for S&S insert positions.
+def get_sns_insert_mask(game: Game, left_end: bool, flip: bool, hand_offset: int, num_slots: int = SCOUT_INSERT_SIZE) -> np.ndarray:
+	"""Return a boolean mask for S&S insert positions.
 	Only positions where inserting the scouted card yields a hand with
 	at least one legal play against the reduced play are legal.
 	Positions correspond to encoded hand slots (with hand_offset applied)."""
@@ -383,14 +463,20 @@ def get_sns_insert_mask(game: Game, left_end: bool, flip: bool, hand_offset: int
 	if flip:
 		card = (card[1], card[0])
 	reduced_play = Play.from_cards(remaining) if remaining else None
-	mask = torch.zeros(SCOUT_INSERT_SIZE, dtype=torch.bool)
-	for pos in range(min(len(hand) + 1, SCOUT_INSERT_SIZE)):
+	mask = np.zeros(num_slots, dtype=np.bool_)
+	for pos in range(min(len(hand) + 1, num_slots)):
 		new_hand = hand[:pos] + [card] + hand[pos:]
 		if _has_any_legal_play(new_hand, reduced_play):
-			slot = (hand_offset + pos) % SCOUT_INSERT_SIZE
+			slot = (hand_offset + pos) % num_slots
 			mask[slot] = True
 	return mask
 
-def decode_slot_to_hand_index(slot: int, hand_offset: int) -> int:
+def decode_slot_to_hand_index(slot: int, hand_offset: int, num_slots: int = HAND_SLOTS) -> int:
 	"""Convert an encoded slot position back to a raw hand index."""
-	return (slot - hand_offset) % HAND_SLOTS
+	return (slot - hand_offset) % num_slots
+
+# Override hot functions with Cython if compiled extension is available
+try:
+	from fast_game import get_legal_plays, _has_any_legal_play, _sns_variant_legal
+except ImportError:
+	pass
