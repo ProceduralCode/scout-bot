@@ -89,6 +89,7 @@ class Game:
 		self.phase = Phase.GAME_OVER
 		self.round_ender: int | None = None
 		self.flips_remaining: set[int] = set()
+		self.turn_number = 0
 
 	def start_round(self):
 		"""Deal cards and enter flip decision phase."""
@@ -111,6 +112,7 @@ class Game:
 		self.round_ender = None
 		self.phase = Phase.FLIP_DECISION
 		self.flips_remaining = set(range(self.num_players))
+		self.turn_number = 0
 
 	def submit_flip_decision(self, player: int, do_flip: bool):
 		assert self.phase == Phase.FLIP_DECISION
@@ -227,6 +229,7 @@ class Game:
 		return False
 
 	def _advance_turn(self):
+		self.turn_number += 1
 		self.current_player = (self.current_player + 1) % self.num_players
 
 	def _end_round(self):
@@ -270,4 +273,5 @@ class Game:
 			"num_players": self.num_players,
 			"round_number": self.round_number,
 			"total_rounds": self.total_rounds,
+			"turn_number": self.turn_number,
 		}

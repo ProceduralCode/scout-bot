@@ -1,8 +1,10 @@
 import torch
 import argparse
+import math
 import time
 import os
 import textwrap
+from collections import deque
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -11,7 +13,7 @@ from encoding import (
 	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, SCOUT_INSERT_SIZE_V2,
 )
 from network import ScoutNetwork, RandomBot
-from training import play_game, play_games_batched, play_eval_game, OpponentPool, compute_gae, prepare_ppo_batch, ppo_update
+from training import play_game, play_games_batched, play_games_with_rollouts, play_eval_game, OpponentPool, compute_gae, prepare_ppo_batch, concatenate_batches, ppo_update, direct_pg_update
 from game_log import GameLog
 from probe import eval_scout_quality
 
@@ -20,14 +22,15 @@ PARAMS = {
 	# "layer_sizes": [256, 128],  # old shallow network
 	"layer_sizes": [512, 256, 256, 128, 128, 128],
 	# "learning_rate": 0.0001, # didn't help
-	# "learning_rate": 0.0003, # base
-	"learning_rate": 0.0004, # base
+	"learning_rate": 0.0003, # base
 	# "learning_rate": 0.0006, # seems slightly worse
 	# "learning_rate": 0.001, # too much
 	# "learning_rate": 0.003, # too much
 	# "batch_size": 256,  # TODO: implement mini-batching within PPO epochs
-	"games_per_iteration": 100,
-	"ppo_epochs": 4, # passes over the batch per iteration
+	"games_per_iteration": 400,
+	# "ppo_epochs": 4, # passes over the batch per iteration
+	"ppo_epochs": 8,
+	"replay_buffer_size": 20,  # keep last N iterations of data for PPO (1 = no buffer)
 	"clip_epsilon": 0.2,
 	"entropy_bonus": 0.01,
 	# "entropy_bonus": 0.05,
@@ -52,20 +55,30 @@ PARAMS = {
 	"snapshot_interval": 30, # add to pool every N iterations
 	"total_iterations": 1_000_000,
 	"log_interval": 1,
-	"save_interval": 500,
-	"eval_interval": 30,
+	"save_interval": 1000,
+	# "save_interval": 100,
+	# "eval_interval": 30,
+	"eval_interval": 5,
 	"encoding_version": 2,
-	"save_dir": "v4_1",
+	# "encoding_version": 4,
+	# Rollout-based advantage estimation (replaces GAE)
+	"use_rollouts": True,
+	"rollout_games": 10,  # real games per iteration (rollouts are per-state within these)
+	"rollouts_per_state": 50,  # N rollout games from each decision point
+	"use_direct_pg": False,  # vanilla policy gradient instead of PPO (forces 1 epoch)
+	"save_dir": "v5_5",
 	"eval_opponents": {
 		# "random": "random", # magic word → uses RandomBot
 		"v1_4": "v1_4/latest.pt",
 		"v2_5": "v2_5/latest.pt",
 		"v3_4": "v3_4/latest.pt",
+		"v4_2": "v4_2/latest.pt",
 	}, # name → checkpoint path (or "random" for RandomBot)
 }
 
 def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, filename, pool=None, extra=None):
 	path = os.path.join(save_dir, filename)
+	tmp_path = path + ".tmp"
 	data = {
 		"model_state": network.state_dict(),
 		"optimizer_state": optimizer.state_dict(),
@@ -77,8 +90,17 @@ def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_d
 		data["opponent_pool"] = pool.state_dicts()
 	if extra:
 		data.update(extra)
-	torch.save(data, path)
-	return path
+	torch.save(data, tmp_path)
+	for attempt in range(5):
+		try:
+			os.replace(tmp_path, path)
+			return path
+		except OSError:
+			if attempt < 4:
+				time.sleep(1)
+	# Last resort: tmp file is still valid, just warn
+	print(f"  WARNING: could not rename {tmp_path} → {filename}, checkpoint saved as .tmp")
+	return tmp_path
 
 def _smooth(vals, window):
 	"""Centered moving average for chart smoothing."""
@@ -250,8 +272,11 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 
 		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
 						   hspace=0.40, wspace=0.25)
-		fig.savefig(chart_path, dpi=100, facecolor=fig.get_facecolor(),
-					bbox_inches='tight', pad_inches=0.15)
+		try:
+			fig.savefig(chart_path, dpi=100, facecolor=fig.get_facecolor(),
+						bbox_inches='tight', pad_inches=0.15)
+		except OSError as e:
+			print(f"  WARNING: failed to save charts: {e}")
 		plt.close(fig)
 
 	# Write text summary with smoothed values
@@ -287,8 +312,11 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 			lines.append(f"  {k}: {', '.join(vals)}")
 		lines.append("")
 
-	with open(summary_path, "w") as f:
-		f.write("\n".join(lines))
+	try:
+		with open(summary_path, "w") as f:
+			f.write("\n".join(lines))
+	except OSError as e:
+		print(f"  WARNING: failed to save summary: {e}")
 
 def train(config: dict | None = None, profile_iters: int | None = None):
 	cfg = {**PARAMS, **(config or {})}
@@ -396,44 +424,74 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		print(f"\nProfiling {profile_iters} iterations ({start_iter} to {profile_stop - 1})...")
 		profiler.start()
 	iteration = start_iter
+	replay_buffer = deque(maxlen=cfg.get("replay_buffer_size", 1))
 	try:
 		for iteration in range(start_iter, cfg["total_iterations"] + 1):
 			t0 = time.time()
-			# Self-play: collect games (batched forward passes)
+			# Self-play: collect games and compute advantages
 			network.eval()
-			iteration_records = play_games_batched(
-				network, cfg["games_per_iteration"], cfg["num_players"],
-				training_seats=cfg["training_seats"],
-				opponent_pool=pool.versions or None,
-				reward_distribution=cfg.get("reward_distribution", "terminal"),
-				reward_mode=cfg.get("reward_mode", "game_score"),
-				shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
+			if cfg.get("use_rollouts"):
+				iteration_records, advantages = play_games_with_rollouts(
+					network, cfg.get("rollout_games", 40), cfg["num_players"],
+					rollouts_per_state=cfg.get("rollouts_per_state", 10),
+					training_seats=cfg["training_seats"])
+				# Value targets: use rollout V estimates stored in record.value
+				returns = [r.value for r in iteration_records]
+				adv_std_val = 1.0  # already normalized
+			else:
+				iteration_records = play_games_batched(
+					network, cfg["games_per_iteration"], cfg["num_players"],
+					training_seats=cfg["training_seats"],
+					opponent_pool=pool.versions or None,
+					reward_distribution=cfg.get("reward_distribution", "terminal"),
+					reward_mode=cfg.get("reward_mode", "game_score"),
+					shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
+				advantages, returns, adv_std_val = compute_gae(
+					iteration_records, gamma=cfg["gamma"], lam=cfg["gae_lambda"])
 			play_time = time.time() - t0
+			if any(math.isnan(r.value) for r in iteration_records):
+				print(f"[iter {iteration:>5}] WARNING: NaN in forward pass, skipping update")
+				continue
 			# PPO training — on-policy, all steps from this iteration
 			network.train()
-			advantages, returns, adv_std_val = compute_gae(
-				iteration_records, gamma=cfg["gamma"], lam=cfg["gae_lambda"])
 			# LR annealing: linear decay to 0
 			lr = cfg["learning_rate"] * (1 - iteration / cfg["total_iterations"])
 			optimizer.param_groups[0]["lr"] = lr
 			batch = prepare_ppo_batch(iteration_records, advantages, returns=returns)
+			use_dpg = cfg.get("use_direct_pg", False)
+			# Replay buffer: accumulate batches for PPO (not used with direct PG)
+			if not use_dpg and batch is not None:
+				replay_buffer.append(batch)
+				training_batch = concatenate_batches(list(replay_buffer))
+			else:
+				training_batch = batch
+			n_epochs = 1 if use_dpg else cfg["ppo_epochs"]
 			ppo_sums = {}
-			for epoch in range(cfg["ppo_epochs"]):
-				m = ppo_update(
-					network, optimizer, batch,
-					clip_epsilon=cfg["clip_epsilon"],
-					entropy_bonus=cfg["entropy_bonus"],
-					value_loss_coeff=cfg["value_loss_coeff"],
-					entropy_floors=cfg.get("entropy_floors"),
-					entropy_floor_coeff=cfg.get("entropy_floor_coeff", 1.0),
-					play_start_size=network.play_start_size,
-				)
-				# Epoch 0: ratios must be ~1.0 (policy hasn't changed yet)
-				if epoch == 0 and abs(m["mean_ratio"] - 1.0) > 0.01:
-					print(f"  WARNING: epoch 0 mean ratio={m['mean_ratio']:.4f} (expected ~1.0)")
+			for epoch in range(n_epochs):
+				if use_dpg:
+					m = direct_pg_update(
+						network, optimizer, training_batch,
+						entropy_bonus=cfg["entropy_bonus"],
+						value_loss_coeff=cfg["value_loss_coeff"],
+						entropy_floors=cfg.get("entropy_floors"),
+						entropy_floor_coeff=cfg.get("entropy_floor_coeff", 1.0),
+						play_start_size=network.play_start_size,
+					)
+				else:
+					m = ppo_update(
+						network, optimizer, training_batch,
+						clip_epsilon=cfg["clip_epsilon"],
+						entropy_bonus=cfg["entropy_bonus"],
+						value_loss_coeff=cfg["value_loss_coeff"],
+						entropy_floors=cfg.get("entropy_floors"),
+						entropy_floor_coeff=cfg.get("entropy_floor_coeff", 1.0),
+						play_start_size=network.play_start_size,
+					)
+					# Epoch 0: ratios must be ~1.0 (stale buffer data shifts this)
+					if epoch == 0 and len(replay_buffer) <= 1 and abs(m["mean_ratio"] - 1.0) > 0.01:
+						print(f"  WARNING: epoch 0 mean ratio={m['mean_ratio']:.4f} (expected ~1.0)")
 				for k, v in m.items():
 					ppo_sums[k] = ppo_sums.get(k, 0.0) + v
-			n_epochs = cfg["ppo_epochs"]
 			ppo_avg = {k: v / n_epochs for k, v in ppo_sums.items()}
 			train_time = time.time() - t0 - play_time
 			# Snapshot to opponent pool
@@ -460,7 +518,8 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				play_pct = n_play / max(n_steps, 1)
 				scout_pct = n_scout / max(n_steps, 1)
 				sns_pct = n_sns / max(n_steps, 1)
-				steps_per_game = n_steps / cfg["games_per_iteration"]
+				num_games = cfg["rollout_games"] if cfg.get("use_rollouts") else cfg["games_per_iteration"]
+				steps_per_game = n_steps / num_games
 				play_lengths = [r.play_length for r in iteration_records if r.play_length is not None]
 				avg_play_length = sum(play_lengths) / max(len(play_lengths), 1)
 				n_plays = max(len(play_lengths), 1)
@@ -486,12 +545,13 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
 				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
 				metrics_history["reward_std"].append(reward_std)
+				buf_str = f"({training_batch['n']})" if training_batch and len(replay_buffer) > 1 else ""
 				print(f"[iter {iteration:>5}] "
 					  f"reward={avg_reward:+.3f}  value={avg_value:+.3f}  "
 					  f"ploss={ppo_avg['policy_loss']:.4f}  vloss={ppo_avg['value_loss']:.4f}  "
 					  f"ent={ppo_avg['entropy']:.3f}  clip={ppo_avg['clip_fraction']:.2f}  "
 					  f"kl={ppo_avg['approx_kl']:.4f}  ev={ppo_avg['explained_variance']:.2f}  "
-					  f"steps={n_steps}  pool={len(pool.versions)}  "
+					  f"steps={n_steps}{buf_str}  pool={len(pool.versions)}  "
 					  f"play={play_time:.1f}s  train={train_time:.1f}s")
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
 			# Periodic snapshots
@@ -504,28 +564,43 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				opponents = pool.sample(cfg["num_players"] - cfg["training_seats"]) or None
 				play_game(network, cfg["num_players"], opponent_pool=opponents, game_log=log,
 						  training_seats=cfg["training_seats"])
-				log.save(os.path.join(save_dir, f"iter_{iteration}_game.json"))
+				try:
+					log.save(os.path.join(save_dir, f"iter_{iteration}_game.json"))
+				except OSError as e:
+					print(f"  WARNING: failed to save game log: {e}")
 				print(f"  Saved snapshot + game log (iter {iteration})")
 			# Eval vs all opponents
 			if iteration % cfg["eval_interval"] == 0:
-				network.eval()
-				n_eval = 40
-				metrics_history["eval_iteration"].append(iteration)
-				for name, eval_net in eval_opponents.items():
-					total_margin = 0.0
-					for _ in range(n_eval):
-						nets = [network] + [eval_net for _ in range(cfg["num_players"] - 1)]
-						scores = play_eval_game(nets, cfg["num_players"])
-						# Compare vs mean opponent score (not max, which biases negative)
-						mean_opponent = sum(scores[1:]) / len(scores[1:])
-						total_margin += scores[0] - mean_opponent
-					avg_margin = total_margin / n_eval
-					metrics_history[f"eval_margin_{name}"].append(avg_margin)
-					print(f"  Eval vs {name}: margin={avg_margin:+.1f}")
-				# Scout placement quality
-				scout_len, scout_n = eval_scout_quality(network, n_samples=200)
-				metrics_history["scout_play_len"].append(scout_len)
-				print(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
+				try:
+					network.eval()
+					n_eval = 40
+					metrics_history["eval_iteration"].append(iteration)
+					for name, eval_net in eval_opponents.items():
+						total_margin = 0.0
+						for _ in range(n_eval):
+							nets = [network] + [eval_net for _ in range(cfg["num_players"] - 1)]
+							scores = play_eval_game(nets, cfg["num_players"])
+							# Compare vs mean opponent score (not max, which biases negative)
+							mean_opponent = sum(scores[1:]) / len(scores[1:])
+							total_margin += scores[0] - mean_opponent
+						avg_margin = total_margin / n_eval
+						metrics_history[f"eval_margin_{name}"].append(avg_margin)
+						print(f"  Eval vs {name}: margin={avg_margin:+.1f}")
+					# Scout placement quality
+					scout_len, scout_n = eval_scout_quality(network, n_samples=200)
+					metrics_history["scout_play_len"].append(scout_len)
+					print(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
+				except Exception as e:
+					print(f"  WARNING: eval failed at iter {iteration}: {e}")
+					# Remove the partial eval_iteration entry if metrics are incomplete
+					expected_keys = [f"eval_margin_{n}" for n in eval_opponents]
+					expected_keys.append("scout_play_len")
+					if (metrics_history["eval_iteration"]
+							and metrics_history["eval_iteration"][-1] == iteration):
+						metrics_history["eval_iteration"].pop()
+						for k in expected_keys:
+							if k in metrics_history and len(metrics_history[k]) > len(metrics_history["eval_iteration"]):
+								metrics_history[k].pop()
 				_save_charts(metrics_history, save_dir, set(eval_opponents))
 			# Profile exit
 			if profiler and iteration >= profile_stop - 1:

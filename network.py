@@ -1,9 +1,35 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from encoding import (
 	INPUT_SIZE, ACTION_TYPE_SIZE, PLAY_START_SIZE, PLAY_END_SIZE, SCOUT_INSERT_SIZE,
+	CNN_CHANNELS_V4, HAND_SLOTS_V4, FLAT_SIZE_V4, CNN_FLAT_SIZE_V4, INPUT_SIZE_V4,
+	PLAY_START_SIZE_V4, PLAY_END_SIZE_V4, SCOUT_INSERT_SIZE_V4,
 )
+
+def build_conditioning(hidden: Tensor, action_type_idx: int | None, start_idx: int | None,
+					   play_start_size: int) -> Tensor:
+	"""Concatenate hidden state with one-hot conditioning vectors for action heads."""
+	unbatched = hidden.ndim == 1
+	if unbatched:
+		hidden = hidden.unsqueeze(0)
+	batch_size = hidden.shape[0]
+	device = hidden.device
+	if action_type_idx is not None and action_type_idx >= 0:
+		action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
+		action_oh[:, action_type_idx] = 1.0
+	else:
+		action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
+	if start_idx is not None and start_idx >= 0:
+		start_oh = torch.zeros(batch_size, play_start_size, device=device)
+		start_oh[:, start_idx] = 1.0
+	else:
+		start_oh = torch.zeros(batch_size, play_start_size, device=device)
+	conditioned = torch.cat([hidden, action_oh, start_oh], dim=1)
+	if unbatched:
+		conditioned = conditioned.squeeze(0)
+	return conditioned
 
 class ResidualBlock(nn.Module):
 	"""Skip connection for same-width consecutive layers."""
@@ -44,31 +70,6 @@ class ScoutNetwork(nn.Module):
 		self.play_end_head = nn.Linear(output_size + conditioning_size, play_end_size)
 		self.scout_insert_head = nn.Linear(output_size + conditioning_size, scout_insert_size)
 
-	def _build_conditioning(self, hidden: Tensor, action_type_idx: int | None, start_idx: int | None) -> Tensor:
-		"""Concatenate hidden state with one-hot conditioning vectors."""
-		unbatched = hidden.ndim == 1
-		if unbatched:
-			hidden = hidden.unsqueeze(0)
-		batch_size = hidden.shape[0]
-		device = hidden.device
-		pss = self.play_start_size
-		# Build action type one-hot
-		if action_type_idx is not None and action_type_idx >= 0:
-			action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
-			action_oh[:, action_type_idx] = 1.0
-		else:
-			action_oh = torch.zeros(batch_size, ACTION_TYPE_SIZE, device=device)
-		# Build start index one-hot
-		if start_idx is not None and start_idx >= 0:
-			start_oh = torch.zeros(batch_size, pss, device=device)
-			start_oh[:, start_idx] = 1.0
-		else:
-			start_oh = torch.zeros(batch_size, pss, device=device)
-		conditioned = torch.cat([hidden, action_oh, start_oh], dim=1)
-		if unbatched:
-			conditioned = conditioned.squeeze(0)
-		return conditioned
-
 	def forward(self, x: Tensor) -> Tensor:
 		"""Run input through shared layers, return hidden state."""
 		return self.shared(x)
@@ -79,22 +80,119 @@ class ScoutNetwork(nn.Module):
 
 	def action_type_logits(self, hidden: Tensor) -> Tensor:
 		"""Step 1: no prior decisions, conditioning is all zeros."""
-		conditioned = self._build_conditioning(hidden, None, None)
+		conditioned = build_conditioning(hidden, None, None, self.play_start_size)
 		return self.action_type_head(conditioned)
 
 	def play_start_logits(self, hidden: Tensor, action_type: int) -> Tensor:
 		"""Step 2: action type known, first_index unknown."""
-		conditioned = self._build_conditioning(hidden, action_type, None)
+		conditioned = build_conditioning(hidden, action_type, None, self.play_start_size)
 		return self.play_start_head(conditioned)
 
 	def play_end_logits(self, hidden: Tensor, action_type: int, start: int) -> Tensor:
 		"""Step 3: both action type and start index known."""
-		conditioned = self._build_conditioning(hidden, action_type, start)
+		conditioned = build_conditioning(hidden, action_type, start, self.play_start_size)
 		return self.play_end_head(conditioned)
 
 	def scout_insert_logits(self, hidden: Tensor, action_type: int) -> Tensor:
 		"""Step 2 alt: action type known, first_index unknown."""
-		conditioned = self._build_conditioning(hidden, action_type, None)
+		conditioned = build_conditioning(hidden, action_type, None, self.play_start_size)
+		return self.scout_insert_head(conditioned)
+
+class CircularCNNScoutNetwork(nn.Module):
+	"""V4 network: circular CNN hand encoder + flat scalars → FC trunk → action heads."""
+
+	def __init__(self, num_filters: int = 32, num_conv_layers: int = 3,
+				 layer_sizes: list[int] | None = None,
+				 play_start_size: int = PLAY_START_SIZE_V4,
+				 play_end_size: int = PLAY_END_SIZE_V4,
+				 scout_insert_size: int = SCOUT_INSERT_SIZE_V4,
+				 encoding_version: int = 4):
+		super().__init__()
+		if layer_sizes is None:
+			layer_sizes = [512, 256, 256, 128, 128, 128]
+		self.layer_sizes = layer_sizes
+		self.encoding_version = encoding_version
+		self.play_start_size = play_start_size
+		self.num_filters = num_filters
+		self.num_conv_layers = num_conv_layers
+
+		# Circular CNN for hand
+		conv_layers = []
+		in_channels = CNN_CHANNELS_V4  # 11
+		for i in range(num_conv_layers):
+			conv_layers.append(nn.Conv1d(in_channels, num_filters, kernel_size=HAND_SLOTS_V4, bias=True))
+			in_channels = num_filters
+		self.conv_layers = nn.ModuleList(conv_layers)
+
+		# FC trunk
+		cnn_flat_size = num_filters * HAND_SLOTS_V4
+		trunk_input = cnn_flat_size + FLAT_SIZE_V4
+		layers = []
+		prev_size = trunk_input
+		for size in layer_sizes:
+			if size == prev_size:
+				layers.append(ResidualBlock(size))
+			else:
+				layers.append(nn.Linear(prev_size, size))
+				layers.append(nn.ReLU())
+			prev_size = size
+		self.trunk = nn.Sequential(*layers)
+
+		# Action heads (same interface as ScoutNetwork)
+		output_size = layer_sizes[-1]
+		conditioning_size = ACTION_TYPE_SIZE + play_start_size
+		self.value_head = nn.Linear(output_size, 1)
+		self.action_type_head = nn.Linear(output_size + conditioning_size, ACTION_TYPE_SIZE)
+		self.play_start_head = nn.Linear(output_size + conditioning_size, play_start_size)
+		self.play_end_head = nn.Linear(output_size + conditioning_size, play_end_size)
+		self.scout_insert_head = nn.Linear(output_size + conditioning_size, scout_insert_size)
+
+	def _circular_conv(self, x: Tensor) -> Tensor:
+		"""Apply circular conv layers. x: (batch, channels, 15)."""
+		for conv in self.conv_layers:
+			# Circular padding: kernel=15 on length=15 needs 14 wrapped elements
+			# so Conv1d sees length 29, producing 29-15+1=15 output positions.
+			pad = HAND_SLOTS_V4 - 1  # 14
+			x = torch.cat([x[:, :, -pad:], x], dim=2)
+			x = F.relu(conv(x))
+		return x
+
+	def forward(self, x: Tensor) -> Tensor:
+		"""Run packed state through CNN + trunk, return hidden state.
+		x: (batch, 279) or (279,) — layout [CNN_flat (165) | flat (114)]."""
+		unbatched = x.ndim == 1
+		if unbatched:
+			x = x.unsqueeze(0)
+		# Split and reshape
+		cnn_input = x[:, :CNN_FLAT_SIZE_V4].reshape(-1, CNN_CHANNELS_V4, HAND_SLOTS_V4)
+		flat_input = x[:, CNN_FLAT_SIZE_V4:]
+		# CNN path
+		cnn_out = self._circular_conv(cnn_input)  # (batch, F, 15)
+		cnn_flat = cnn_out.flatten(1)  # (batch, F*15)
+		# Concat and run trunk
+		combined = torch.cat([cnn_flat, flat_input], dim=1)
+		hidden = self.trunk(combined)
+		if unbatched:
+			hidden = hidden.squeeze(0)
+		return hidden
+
+	def value(self, hidden: Tensor) -> Tensor:
+		return self.value_head(hidden)
+
+	def action_type_logits(self, hidden: Tensor) -> Tensor:
+		conditioned = build_conditioning(hidden, None, None, self.play_start_size)
+		return self.action_type_head(conditioned)
+
+	def play_start_logits(self, hidden: Tensor, action_type: int) -> Tensor:
+		conditioned = build_conditioning(hidden, action_type, None, self.play_start_size)
+		return self.play_start_head(conditioned)
+
+	def play_end_logits(self, hidden: Tensor, action_type: int, start: int) -> Tensor:
+		conditioned = build_conditioning(hidden, action_type, start, self.play_start_size)
+		return self.play_end_head(conditioned)
+
+	def scout_insert_logits(self, hidden: Tensor, action_type: int) -> Tensor:
+		conditioned = build_conditioning(hidden, action_type, None, self.play_start_size)
 		return self.scout_insert_head(conditioned)
 
 class RandomBot:

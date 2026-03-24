@@ -22,11 +22,20 @@ from encoding import (
 	get_play_start_mask, get_play_end_mask, get_scout_insert_mask,
 	decode_slot_to_hand_index, decode_action_type,
 	HAND_SLOTS, PLAY_SLOTS, PLAY_START_SIZE, PLAY_END_SIZE,
-	ACTION_TYPE_SIZE, SCOUT_INSERT_SIZE,
+	ACTION_TYPE_SIZE, SCOUT_INSERT_SIZE, INPUT_SIZE,
 	# V2
 	encode_state_v2, HAND_SLOTS_V2, SCOUT_INSERT_SIZE_V2,
+	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, INPUT_SIZE_V2,
+	# V3
+	encode_state_v3, HAND_SLOTS_V3, SCOUT_INSERT_SIZE_V3,
+	PLAY_START_SIZE_V3, PLAY_END_SIZE_V3, INPUT_SIZE_V3,
+	PLAY_BUFFER_SLOTS_V3,
+	# V4
+	encode_state_v4, HAND_SLOTS_V4, SCOUT_INSERT_SIZE_V4,
+	PLAY_START_SIZE_V4, PLAY_END_SIZE_V4, INPUT_SIZE_V4,
+	FLAT_PLAY_BUFFER_SLOTS_V4,
 )
-from network import ScoutNetwork, masked_sample
+from network import ScoutNetwork, CircularCNNScoutNetwork, masked_sample
 from training import StepRecord, compute_gae, prepare_ppo_batch, ppo_update
 
 NUM_PLAYERS = 4
@@ -38,8 +47,24 @@ CLIP_EPSILON = 0.2
 VALUE_LOSS_COEFF = 0.25
 ENTROPY_FLOORS = None
 ENTROPY_FLOOR_COEFF = 1.0
+ENCODING_VERSION = 1  # set by --v2 flag
 
 # --- Helpers ---
+
+def _make_network(layer_sizes=None):
+	"""Create a ScoutNetwork with the right encoding version."""
+	ls = layer_sizes or LAYER_SIZES
+	if ENCODING_VERSION == 4:
+		return CircularCNNScoutNetwork(layer_sizes=ls)
+	if ENCODING_VERSION == 3:
+		return ScoutNetwork(INPUT_SIZE_V3, ls, encoding_version=3,
+			play_start_size=PLAY_START_SIZE_V3, play_end_size=PLAY_END_SIZE_V3,
+			scout_insert_size=SCOUT_INSERT_SIZE_V3)
+	if ENCODING_VERSION == 2:
+		return ScoutNetwork(INPUT_SIZE_V2, ls, encoding_version=2,
+			play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
+			scout_insert_size=SCOUT_INSERT_SIZE_V2)
+	return ScoutNetwork(INPUT_SIZE, ls)
 
 def _fresh_round():
 	"""Create a game at the start of a round (TURN phase, no current play)."""
@@ -51,6 +76,17 @@ def _fresh_round():
 
 def _encode(game, player=0):
 	"""Encode game state with random offsets. Returns (state_tensor, hand_offset, play_offset)."""
+	if ENCODING_VERSION == 4:
+		ho = random.randint(0, HAND_SLOTS_V4 - 1)
+		po = random.randint(0, FLAT_PLAY_BUFFER_SLOTS_V4 - 1) if game.current_play else 0
+		return encode_state_v4(game, player, ho, po), ho, po
+	if ENCODING_VERSION == 3:
+		ho = random.randint(0, HAND_SLOTS_V3 - 1)
+		po = random.randint(0, PLAY_BUFFER_SLOTS_V3 - 1) if game.current_play else 0
+		return encode_state_v3(game, player, ho, po), ho, po
+	if ENCODING_VERSION == 2:
+		ho = random.randint(0, HAND_SLOTS_V2 - 1)
+		return encode_state_v2(game, player, ho), ho, 0
 	ho = random.randint(0, HAND_SLOTS - 1)
 	po = random.randint(0, PLAY_SLOTS - 1) if game.current_play else 0
 	return encode_state(game, player, ho, po), ho, po
@@ -80,6 +116,15 @@ def _sample_play(network, game, player=0, force_start_idx=None, force_end_to_sta
 	"""Run network forward on a game state and sample a play action.
 	Returns dict with all StepRecord fields (except reward/game_id) plus metadata,
 	or None if the state doesn't meet constraints (e.g., force_start has no multi-end)."""
+	compact = ENCODING_VERSION >= 2  # v2+ use same 15-slot heads
+	if ENCODING_VERSION == 4:
+		_hs, _pss, _pes = HAND_SLOTS_V4, PLAY_START_SIZE_V4, PLAY_END_SIZE_V4
+	elif ENCODING_VERSION == 3:
+		_hs, _pss, _pes = HAND_SLOTS_V3, PLAY_START_SIZE_V3, PLAY_END_SIZE_V3
+	elif ENCODING_VERSION == 2:
+		_hs, _pss, _pes = HAND_SLOTS_V2, PLAY_START_SIZE_V2, PLAY_END_SIZE_V2
+	else:
+		_hs, _pss, _pes = HAND_SLOTS, PLAY_START_SIZE, PLAY_END_SIZE
 	hand = game.players[player].hand
 	legal_plays = get_legal_plays(hand, game.current_play)
 	if not legal_plays:
@@ -92,31 +137,31 @@ def _sample_play(network, game, player=0, force_start_idx=None, force_end_to_sta
 
 		# Action type — always play at round start (only legal option)
 		at_logits = network.action_type_logits(hidden)
-		at_mask = get_action_type_mask(game, legal_plays)
+		at_mask = get_action_type_mask(game, legal_plays, max_hand=_hs)
 		action_type = 0  # play
 
 		# Play start
 		ps_logits = network.play_start_logits(hidden, action_type)
 		if force_start_idx is not None:
 			# Override mask to only allow the forced start
-			ps_mask = np.zeros(PLAY_START_SIZE, dtype=np.bool_)
-			ps_mask[(ho + force_start_idx) % HAND_SLOTS] = True
+			ps_mask = np.zeros(_pss, dtype=np.bool_)
+			ps_mask[(ho + force_start_idx) % _hs] = True
 		else:
-			ps_mask = get_play_start_mask(legal_plays, ho)
+			ps_mask = get_play_start_mask(legal_plays, ho, num_slots=_pss)
 		start_slot, _ = masked_sample(ps_logits, torch.from_numpy(ps_mask))
-		start_idx = decode_slot_to_hand_index(start_slot, ho)
+		start_idx = decode_slot_to_hand_index(start_slot, ho, num_slots=_hs)
 
 		# Play end
 		pe_logits = network.play_end_logits(hidden, action_type, start_slot)
 		if force_end_to_start:
-			pe_mask = np.zeros(PLAY_END_SIZE, dtype=np.bool_)
+			pe_mask = np.zeros(_pes, dtype=np.bool_)
 			pe_mask[start_slot] = True
 		else:
-			pe_mask = get_play_end_mask(legal_plays, start_idx, ho)
+			pe_mask = get_play_end_mask(legal_plays, start_idx, ho, num_slots=_pes)
 		if not pe_mask.any():
 			return None
 		end_slot, _ = masked_sample(pe_logits, torch.from_numpy(pe_mask))
-		end_idx = decode_slot_to_hand_index(end_slot, ho)
+		end_idx = decode_slot_to_hand_index(end_slot, ho, num_slots=_hs)
 
 	length = end_idx - start_idx + 1
 	return {
@@ -171,6 +216,7 @@ def _train_iteration(network, optimizer, records, verbose=False,
 			value_loss_coeff=VALUE_LOSS_COEFF,
 			entropy_floors=entropy_floors,
 			entropy_floor_coeff=entropy_floor_coeff,
+			play_start_size=PLAY_START_SIZE_V4 if ENCODING_VERSION == 4 else (PLAY_START_SIZE_V3 if ENCODING_VERSION == 3 else (PLAY_START_SIZE_V2 if ENCODING_VERSION == 2 else PLAY_START_SIZE)),
 		)
 		for k, v in m.items():
 			ppo_sums[k] = ppo_sums.get(k, 0.0) + v
@@ -212,7 +258,7 @@ def eval_scout_quality(network, n_samples=200):
 def probe_value(n_iters=100, n_games=50):
 	"""Probe 1: Can the value head learn a constant return?
 	Every state gets reward=+1.0, so the value head should converge to ~1.0."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	# Measure initial
@@ -266,7 +312,7 @@ def probe_play_start(n_iters=100, n_games=50):
 def _probe_play_start_fixed(n_iters, n_games):
 	"""2a: Reward whichever legal start slot has the lowest index.
 	The network just needs to learn 'pick the lowest slot' — trivial pattern."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def target_start(legal_plays):
@@ -320,7 +366,7 @@ def _probe_play_start_fixed(n_iters, n_games):
 
 def _probe_play_start_best(n_iters, n_games):
 	"""2b: Reward the start with the most end options (harder generalization)."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def best_start(legal_plays):
@@ -374,7 +420,7 @@ def probe_play_end(n_iters=100, n_games=50):
 	"""Probe 3: Can the play_end head learn to prefer longer plays?
 	Forces start to a position with 3+ valid ends.
 	Rewards the longest available play."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def find_state_and_start():
@@ -448,7 +494,7 @@ def probe_play_end(n_iters=100, n_games=50):
 def probe_full_chain(n_iters=100, n_games=50):
 	"""Probe 4: Can start+end jointly learn to maximize play length?
 	No forced actions — both heads free. Reward proportional to play length."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	# Measure initial mean play length
@@ -525,7 +571,19 @@ def _sample_scout(network, game, player=1):
 	card = play_cards[0]  # left end, no flip
 	action_type = 1  # scout-left-normal
 	ev = getattr(network, 'encoding_version', 1)
-	if ev == 2:
+	if ev == 4:
+		_hs = HAND_SLOTS_V4
+		_sis = SCOUT_INSERT_SIZE_V4
+		ho = random.randint(0, _hs - 1)
+		po = random.randint(0, FLAT_PLAY_BUFFER_SLOTS_V4 - 1) if game.current_play else 0
+		state = encode_state_v4(game, player, ho, po)
+	elif ev == 3:
+		_hs = HAND_SLOTS_V3
+		_sis = SCOUT_INSERT_SIZE_V3
+		ho = random.randint(0, _hs - 1)
+		po = random.randint(0, PLAY_BUFFER_SLOTS_V3 - 1) if game.current_play else 0
+		state = encode_state_v3(game, player, ho, po)
+	elif ev == 2:
 		_hs = HAND_SLOTS_V2
 		_sis = SCOUT_INSERT_SIZE_V2
 		ho = random.randint(0, _hs - 1)
@@ -533,7 +591,9 @@ def _sample_scout(network, game, player=1):
 	else:
 		_hs = HAND_SLOTS
 		_sis = SCOUT_INSERT_SIZE
-		state, ho, po = _encode(game, player)
+		ho = random.randint(0, _hs - 1)
+		po = random.randint(0, PLAY_SLOTS - 1) if game.current_play else 0
+		state = encode_state(game, player, ho, po)
 	with torch.no_grad():
 		hidden = network(state)
 		value = network.value(hidden).item()
@@ -575,7 +635,7 @@ def probe_scout_insert(n_iters=100, n_games=50):
 	"""Probe 5: Can the scout_insert head learn to place cards where they create better plays?
 	Forces a scout action with a locked action_type mask (no gradient noise from at head).
 	Continuous reward based on hand quality at chosen position vs best/worst possible."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def insert_qualities(hand, card):
@@ -657,7 +717,7 @@ def probe_scout_adjacent(n_iters=100, n_games=50):
 	Simpler than probe 5 — tests whether the head can extract card values from the
 	encoding and match them, rather than optimizing full hand quality.
 	Only uses states where the hand contains at least one card matching the scouted card's value."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def _is_adjacent_match(hand, card, insert_pos):
@@ -714,10 +774,12 @@ def probe_scout_adjacent(n_iters=100, n_games=50):
 			reward = 1.0 if adj else -1.0
 			records.append(_make_scout_record(sample, reward=reward, game_id=g))
 		if records:
-			verbose = (it < 3 or it == n_iters - 1)
+			log_interval = max(1, n_iters // 10)
+			verbose = (it % log_interval == 0 or it == n_iters - 1)
+			avg = _train_iteration(network, optimizer, records, verbose=False)
 			if verbose:
-				print(f"  [5b iter {it}]")
-			_train_iteration(network, optimizer, records, verbose=verbose)
+				rate = _eval_rate(network)
+				print(f"  iter {it:4d}  adj={rate:.3f}  ent={avg['entropy']:.3f}  ploss={avg['policy_loss']:.5f}")
 
 	# Measure final
 	network.eval()
@@ -731,6 +793,14 @@ def probe_scout_adjacent(n_iters=100, n_games=50):
 def _sample_action_type(network, game, player=1):
 	"""Run network on a mid-round state and sample an action type.
 	Returns dict with action type info, or None."""
+	if ENCODING_VERSION == 4:
+		_hs = HAND_SLOTS_V4
+	elif ENCODING_VERSION == 3:
+		_hs = HAND_SLOTS_V3
+	elif ENCODING_VERSION == 2:
+		_hs = HAND_SLOTS_V2
+	else:
+		_hs = HAND_SLOTS
 	hand = game.players[player].hand
 	legal_plays = get_legal_plays(hand, game.current_play)
 
@@ -740,7 +810,7 @@ def _sample_action_type(network, game, player=1):
 		value = network.value(hidden).item()
 
 		at_logits = network.action_type_logits(hidden)
-		at_mask = get_action_type_mask(game, legal_plays)
+		at_mask = get_action_type_mask(game, legal_plays, max_hand=_hs)
 		if not at_mask.any():
 			return None
 		action_type, _ = masked_sample(at_logits, torch.from_numpy(at_mask))
@@ -770,7 +840,7 @@ def probe_action_type(n_iters=100, n_games=50):
 	"""Probe 6: Can the action_type head learn to prefer play over scout?
 	Mid-round states where both play and scout are legal.
 	Reward +1 for playing, -1 for scouting. Simple preference test."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	# Measure initial play rate
@@ -836,7 +906,7 @@ def probe_gae_multistep(n_iters=100, n_games=50):
 
 	Measures whether the value head learns to predict returns from step 1 and 2
 	(not just step 3), which requires GAE bootstrapping to work."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 	STEPS_PER_EP = 3
 
@@ -917,8 +987,9 @@ def probe_frozen_trunk_scout(n_iters=100, n_games=50):
 	checkpoint = torch.load(ckpt_path, weights_only=False)
 	ckpt_cfg = checkpoint.get("config", {})
 	layer_sizes = ckpt_cfg.get("layer_sizes", [256, 128])
-
-	network = ScoutNetwork(layer_sizes=layer_sizes)
+	ckpt_ev = ckpt_cfg.get("encoding_version", 1)
+	input_size = INPUT_SIZE_V3 if ckpt_ev == 3 else (INPUT_SIZE_V2 if ckpt_ev == 2 else INPUT_SIZE)
+	network = ScoutNetwork(input_size, layer_sizes, encoding_version=ckpt_ev)
 	network.load_state_dict(checkpoint["model_state"])
 
 	# Freeze shared trunk — only train scout_insert_head
@@ -1007,6 +1078,7 @@ def probe_frozen_trunk_scout(n_iters=100, n_games=50):
 					value_loss_coeff=0.0,  # don't train frozen value head
 					entropy_floors=ENTROPY_FLOORS,
 					entropy_floor_coeff=ENTROPY_FLOOR_COEFF,
+					play_start_size=PLAY_START_SIZE_V3 if ckpt_ev == 3 else (PLAY_START_SIZE_V2 if ckpt_ev == 2 else PLAY_START_SIZE),
 				)
 
 	# Measure final
@@ -1021,7 +1093,7 @@ def probe_frozen_trunk_scout(n_iters=100, n_games=50):
 def probe_trivial_scout(n_iters=100, n_games=50):
 	"""Probe 9: Can the scout head learn to always insert at position 0?
 	Trivially easy control test — if this fails, the training mechanics are broken."""
-	network = ScoutNetwork(layer_sizes=LAYER_SIZES)
+	network = _make_network()
 	optimizer = torch.optim.Adam(network.parameters(), lr=LR)
 
 	def _eval_pos0_rate(network, n_samples=500):
@@ -1096,9 +1168,21 @@ def main():
 		help="Override network layer sizes (e.g., --layers 512 256 256 128 128 128)")
 	parser.add_argument("--entropy-floors", action="store_true",
 		help="Enable entropy floors (same values as main.py training config)")
+	parser.add_argument("--v2", action="store_true",
+		help="Use v2 encoding (fixed-position, 15 slots)")
+	parser.add_argument("--v3", action="store_true",
+		help="Use v3 encoding (scalar values + pairwise diffs, 285 dims)")
+	parser.add_argument("--v4", action="store_true",
+		help="Use v4 encoding (circular CNN + flat scalars, 279 dims)")
 	args = parser.parse_args()
 
-	global LAYER_SIZES, ENTROPY_FLOORS, ENTROPY_FLOOR_COEFF
+	global LAYER_SIZES, ENTROPY_FLOORS, ENTROPY_FLOOR_COEFF, ENCODING_VERSION
+	if args.v4:
+		ENCODING_VERSION = 4
+	elif args.v3:
+		ENCODING_VERSION = 3
+	elif args.v2:
+		ENCODING_VERSION = 2
 	if args.layers:
 		LAYER_SIZES = args.layers
 	if args.entropy_floors:
@@ -1110,7 +1194,7 @@ def main():
 		}
 		ENTROPY_FLOOR_COEFF = 1.0
 	probe_nums = args.probe if args.probe else sorted(ALL_PROBES.keys())
-	print(f"Running probes {probe_nums} (iters={args.iters}, games={args.games}, layers={LAYER_SIZES})")
+	print(f"Running probes {probe_nums} (iters={args.iters}, games={args.games}, layers={LAYER_SIZES}, encoding=v{ENCODING_VERSION})")
 	print()
 	results = []
 	for num in probe_nums:

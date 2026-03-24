@@ -150,6 +150,266 @@ def play_eval_game(networks: list, num_players: int,
 		game_log.record_game_end(game.cumulative_scores)
 	return game.cumulative_scores
 
+def rollout_from_state(game_snapshot: Game, network: ScoutNetwork) -> list[int]:
+	"""Play a game snapshot to round completion using network for all seats.
+	Returns round scores for all players."""
+	game = copy.deepcopy(game_snapshot)
+	num_players = game.num_players
+	networks = [network] * num_players
+	# Play remaining turns until round ends
+	while game.phase in (Phase.TURN, Phase.SNS_PLAY):
+		_play_turn(game, networks)
+	return game.get_round_scores()
+
+def rollout_from_states_batched(snapshots: list[Game], network: ScoutNetwork) -> list[list[int]]:
+	"""Play multiple game snapshots to round completion with batched forward passes.
+	Each snapshot is deepcopied and played independently using network for all seats.
+	Returns list of round scores (one per snapshot)."""
+	if not snapshots:
+		return []
+	ev = getattr(network, 'encoding_version', 1)
+	v2 = ev == 2
+	_hs = HAND_SLOTS_V2 if v2 else HAND_SLOTS
+	_sis = SCOUT_INSERT_SIZE_V2 if v2 else SCOUT_INSERT_SIZE
+	_pss = PLAY_START_SIZE_V2 if v2 else PLAY_START_SIZE
+	games = [copy.deepcopy(s) for s in snapshots]
+	with torch.no_grad():
+		while True:
+			# Collect games that still need turns played
+			pending = []  # (game_idx, player, hand_offset, state_tensor)
+			for g_idx, g in enumerate(games):
+				if g.phase in (Phase.TURN, Phase.SNS_PLAY):
+					p = g.current_player
+					if v2:
+						ho = random.randint(0, HAND_SLOTS_V2 - 1)
+						state = encode_state_v2(g, p, ho)
+					else:
+						ho = random.randint(0, HAND_SLOTS - 1)
+						po = random.randint(0, PLAY_SLOTS - 1)
+						state = encode_state(g, p, ho, po)
+					pending.append((g_idx, p, ho, 0 if v2 else po, state))
+			if not pending:
+				break
+			B = len(pending)
+			states = torch.stack([p[4] for p in pending])
+			hidden_batch = network(states)
+			# --- Action type ---
+			tp_games = []
+			for g_idx, p, ho, po, state in pending:
+				g = games[g_idx]
+				hand = g.players[p].hand
+				legal_plays = get_legal_plays(hand, g.current_play)
+				tp_games.append((g, g_idx, p, ho, po, hand, legal_plays))
+			at_cond = _build_batch_conditioning(hidden_batch, None, None, play_start_size=_pss)
+			at_logits_batch = network.action_type_head(at_cond)
+			at_masks_np = [get_action_type_mask(tp[0], tp[6], max_hand=_hs) for tp in tp_games]
+			at_masks = torch.from_numpy(np.stack(at_masks_np))
+			has_action = at_masks.any(dim=1)
+			for bi in range(B):
+				if not has_action[bi]:
+					tp_games[bi][0]._advance_turn()
+			action_types = batched_masked_sample(at_logits_batch, at_masks)
+			action_infos = [decode_action_type(action_types[bi].item()) for bi in range(B)]
+			play_bi = [bi for bi in range(B) if has_action[bi] and action_infos[bi]["type"] == "play"]
+			scout_all = [bi for bi in range(B) if has_action[bi] and action_infos[bi]["type"] in ("scout", "sns")]
+			# --- Play start + end ---
+			play_starts = {}
+			play_ends = {}
+			if play_bi:
+				p_idx = torch.tensor(play_bi, dtype=torch.long)
+				ps_cond = _build_batch_conditioning(
+					hidden_batch[p_idx], action_types[p_idx], None, play_start_size=_pss)
+				ps_logits = network.play_start_head(ps_cond)
+				ps_masks = torch.from_numpy(np.stack(
+					[get_play_start_mask(tp_games[bi][6], tp_games[bi][3], num_slots=_hs) for bi in play_bi]))
+				ps_samples = batched_masked_sample(ps_logits, ps_masks)
+				for i, bi in enumerate(play_bi):
+					play_starts[bi] = ps_samples[i].item()
+				pe_cond = _build_batch_conditioning(
+					hidden_batch[p_idx], action_types[p_idx], ps_samples, play_start_size=_pss)
+				pe_logits = network.play_end_head(pe_cond)
+				pe_masks = torch.from_numpy(np.stack([
+					get_play_end_mask(tp_games[bi][6],
+						decode_slot_to_hand_index(play_starts[bi], tp_games[bi][3], num_slots=_hs),
+						tp_games[bi][3], num_slots=_hs)
+					for bi in play_bi]))
+				pe_samples = batched_masked_sample(pe_logits, pe_masks)
+				for i, bi in enumerate(play_bi):
+					play_ends[bi] = pe_samples[i].item()
+			# --- Scout / S&S insert ---
+			scout_inserts = {}
+			if scout_all:
+				s_idx = torch.tensor(scout_all, dtype=torch.long)
+				si_cond = _build_batch_conditioning(
+					hidden_batch[s_idx], action_types[s_idx], None, play_start_size=_pss)
+				si_logits = network.scout_insert_head(si_cond)
+				si_masks_list = []
+				for bi in scout_all:
+					if action_infos[bi]["type"] == "scout":
+						si_masks_list.append(get_scout_insert_mask(tp_games[bi][0], tp_games[bi][3], num_slots=_sis))
+					else:
+						si_masks_list.append(get_sns_insert_mask(
+							tp_games[bi][0], action_infos[bi]["left_end"],
+							action_infos[bi]["flip"], tp_games[bi][3], num_slots=_sis))
+				si_masks = torch.from_numpy(np.stack(si_masks_list))
+				si_samples = batched_masked_sample(si_logits, si_masks)
+				for i, bi in enumerate(scout_all):
+					scout_inserts[bi] = si_samples[i].item()
+			# --- Apply game mutations ---
+			for bi in range(B):
+				if not has_action[bi]:
+					continue
+				g, g_idx, p, ho, po, hand, legal_plays = tp_games[bi]
+				info = action_infos[bi]
+				if info["type"] == "play":
+					start_idx = decode_slot_to_hand_index(play_starts[bi], ho, num_slots=_hs)
+					end_idx = decode_slot_to_hand_index(play_ends[bi], ho, num_slots=_hs)
+					g.apply_play(start_idx, end_idx)
+				elif info["type"] == "scout":
+					insert_pos = (scout_inserts[bi] - ho) % _sis
+					g.apply_scout(info["left_end"], info["flip"], insert_pos)
+				elif info["type"] == "sns":
+					insert_pos = (scout_inserts[bi] - ho) % _sis
+					g.apply_sns_scout(info["left_end"], info["flip"], insert_pos)
+	return [g.get_round_scores() for g in games]
+
+def play_games_with_rollouts(network: ScoutNetwork, num_games: int,
+							 num_players: int, rollouts_per_state: int = 10,
+							 training_seats: int = 4) -> tuple[list[StepRecord], list[float]]:
+	"""Play games with rollout-based advantage estimation.
+	At each decision point, snapshots the game state. After the game,
+	runs rollouts from each snapshot to estimate state values.
+	Returns (records, normalized_advantages)."""
+	ev = getattr(network, 'encoding_version', 1)
+	all_records: list[StepRecord] = []
+	all_advantages: list[float] = []
+	network.eval()
+	with torch.no_grad():
+		for game_idx in range(num_games):
+			game = Game(num_players)
+			if ev == 2:
+				game.starting_player = random.randint(0, num_players - 1)
+				game.total_rounds = 1
+			networks = [network] * num_players
+			game.start_round()
+			# Flip decisions
+			for p in range(num_players):
+				net = networks[p]
+				ev_p = getattr(net, 'encoding_version', 1)
+				if ev_p == 2:
+					ho = random.randint(0, HAND_SLOTS_V2 - 1)
+					t_normal, t_flipped = encode_hand_both_orientations_v2(game, p, ho)
+				else:
+					ho = random.randint(0, HAND_SLOTS - 1)
+					po = random.randint(0, PLAY_SLOTS - 1)
+					t_normal, t_flipped = encode_hand_both_orientations(game, p, ho, po)
+				h_normal = net(t_normal)
+				h_flipped = net(t_flipped)
+				v_normal = net.value(h_normal).item()
+				v_flipped = net.value(h_flipped).item()
+				game.submit_flip_decision(p, do_flip=v_flipped > v_normal)
+			# Play turns, snapshotting before each decision
+			snapshots = []  # (game_snapshot, record_indices)
+			records = []
+			snapshots.append(copy.deepcopy(game))
+			while game.phase in (Phase.TURN, Phase.SNS_PLAY):
+				pre_len = len(records)
+				step_records = _play_turn(game, networks)
+				records.extend(step_records)
+				# Snapshot after action (= before next action)
+				if step_records:
+					snapshots.append(copy.deepcopy(game))
+			# Map each record to its (before_snapshot_idx, after_snapshot_idx)
+			# Records are created in order, one snapshot between each action
+			# snapshot[0] = before first action, snapshot[1] = after first action, etc.
+			# Some _play_turn calls produce 0 records (skip) or 2 records (S&S).
+			# Walk through and assign snapshot indices to records.
+			record_snapshot_pairs = []  # (before_idx, after_idx) per record
+			snap_idx = 0
+			rec_cursor = 0
+			while rec_cursor < len(records):
+				# Find how many records came from this turn
+				# Each _play_turn call produced records between snapshots[snap_idx] and snapshots[snap_idx+1]
+				# We need to replay the turn structure. A turn can produce:
+				# - 0 records (skip, no snapshot added)
+				# - 1 record (play or scout)
+				# - 2 records (S&S: scout + forced play)
+				# Snapshots were added after each _play_turn that produced records.
+				# So snap_idx corresponds to before, snap_idx+1 to after.
+				# For S&S with 2 records, both share the same snapshot pair.
+				# Find the next batch: records from the same turn share the same player
+				# and were added in one _play_turn call
+				turn_start = rec_cursor
+				# S&S produces 2 records: scout then play. The play record has
+				# a different action_type but was from the same _play_turn call.
+				# We know the turn boundary: after the first record, if the next
+				# record is an S&S forced play (action_type == 0 following an sns),
+				# they belong together.
+				rec_cursor += 1
+				if rec_cursor < len(records) and records[turn_start].action_type >= 5:
+					# S&S scout — next record is the forced play
+					if rec_cursor < len(records):
+						rec_cursor += 1
+				for i in range(turn_start, rec_cursor):
+					record_snapshot_pairs.append((snap_idx, snap_idx + 1))
+				snap_idx += 1
+			# Run rollouts from all snapshots in one batched call
+			# Expand: each snapshot × rollouts_per_state copies
+			expanded = [snap for snap in snapshots for _ in range(rollouts_per_state)]
+			all_scores = rollout_from_states_batched(expanded, network)
+			# Aggregate back to per-snapshot, per-player margins
+			num_snapshots = len(snapshots)
+			snapshot_values = []  # [snap_idx][player] = avg_margin
+			for snap_idx in range(num_snapshots):
+				player_margins = [0.0] * num_players
+				base = snap_idx * rollouts_per_state
+				for r in range(rollouts_per_state):
+					scores = all_scores[base + r]
+					for p in range(num_players):
+						opp_scores = [scores[j] for j in range(num_players) if j != p]
+						margin = (scores[p] - sum(opp_scores) / len(opp_scores)) / 10.0
+						player_margins[p] += margin
+				snapshot_values.append([m / rollouts_per_state for m in player_margins])
+			# Compute advantages: V_after - V_before for each record's player
+			game_advantages = []
+			for rec_idx, (before_snap, after_snap) in enumerate(record_snapshot_pairs):
+				p = records[rec_idx].player
+				v_before = snapshot_values[before_snap][p]
+				v_after = snapshot_values[after_snap][p]
+				game_advantages.append(v_after - v_before)
+			# Store the rollout value as record.value (for value function training)
+			for rec_idx, (before_snap, _) in enumerate(record_snapshot_pairs):
+				p = records[rec_idx].player
+				records[rec_idx].value = snapshot_values[before_snap][p]
+			# Assign game_id and filter to training seats
+			for rec in records:
+				rec.game_id = game_idx
+			# Keep all records since training_seats=4 means all players use training network
+			filtered_indices = [i for i, r in enumerate(records) if r.player < training_seats]
+			all_records.extend(records[i] for i in filtered_indices)
+			all_advantages.extend(game_advantages[i] for i in filtered_indices)
+	# Diagnostic: per-action-type advantage statistics (before normalization)
+	if all_advantages:
+		play_advs = [a for a, r in zip(all_advantages, all_records) if r.action_type < 5]
+		scout_advs = [a for a, r in zip(all_advantages, all_records) if r.action_type >= 5 and r.scout_insert is not None]
+		at_only_advs = [a for a, r in zip(all_advantages, all_records) if r.action_type >= 5 and r.scout_insert is None]
+		def _stats(vals, label):
+			if not vals:
+				return
+			m = sum(vals) / len(vals)
+			s = (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+			print(f"  ADV-DIAG {label}: n={len(vals)}  mean={m:+.5f}  std={s:.5f}  "
+				  f"range=[{min(vals):+.5f}, {max(vals):+.5f}]")
+		_stats(all_advantages, "ALL")
+		_stats(play_advs, "PLAY")
+		_stats(scout_advs, "SCOUT")
+	# Normalize advantages
+	if all_advantages:
+		mean = sum(all_advantages) / len(all_advantages)
+		std = (sum((a - mean) ** 2 for a in all_advantages) / len(all_advantages)) ** 0.5
+		all_advantages = [(a - mean) / (std + 1e-8) for a in all_advantages]
+	return all_records, all_advantages
+
 def _play_round(game: Game, networks: list[ScoutNetwork],
 				game_log: GameLog | None = None) -> list[StepRecord]:
 	"""Play one round, returning step records for all players."""
@@ -833,6 +1093,49 @@ def prepare_ppo_batch(steps: list[StepRecord], advantages: list[float],
 		batch["scout_old_logits"] = torch.stack([steps[i].scout_insert_logits for i in scout_idx])
 	return batch
 
+def concatenate_batches(batches: list[dict]) -> dict:
+	"""Concatenate multiple PPO batches, offsetting sub-head indices.
+	Used for replay buffer: combine current + previous iterations' data."""
+	if len(batches) == 1:
+		return batches[0]
+
+	combined = {
+		"states": torch.cat([b["states"] for b in batches]),
+		"at_masks": torch.cat([b["at_masks"] for b in batches]),
+		"at_actions": torch.cat([b["at_actions"] for b in batches]),
+		"old_at_logits": torch.cat([b["old_at_logits"] for b in batches]),
+		"adv": torch.cat([b["adv"] for b in batches]),
+		"v_target": torch.cat([b["v_target"] for b in batches]),
+	}
+	combined["n"] = combined["states"].shape[0]
+
+	# Re-normalize advantages across combined batch
+	adv = combined["adv"]
+	combined["adv"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+	# Sub-heads have idx tensors (indices into states) that need offset
+	sub_heads = [
+		("play_idx", ["play_at", "play_masks", "play_actions", "play_old_logits"]),
+		("end_idx", ["end_at", "end_starts", "end_masks", "end_actions", "end_old_logits"]),
+		("scout_idx", ["scout_at", "scout_masks", "scout_actions", "scout_old_logits"]),
+	]
+	for idx_key, data_keys in sub_heads:
+		idx_parts = []
+		data_parts = {k: [] for k in data_keys}
+		offset = 0
+		for b in batches:
+			if idx_key in b:
+				idx_parts.append(b[idx_key] + offset)
+				for k in data_keys:
+					data_parts[k].append(b[k])
+			offset += b["n"]
+		if idx_parts:
+			combined[idx_key] = torch.cat(idx_parts)
+			for k in data_keys:
+				combined[k] = torch.cat(data_parts[k])
+
+	return combined
+
 def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 			   batch: dict, clip_epsilon: float = 0.2, entropy_bonus: float = 0.01,
 			   value_loss_coeff: float = 0.25, max_grad_norm: float = 0.5,
@@ -989,6 +1292,157 @@ def ppo_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
 		"mean_ratio": mean_ratio,
 		"clip_fraction": clip_fraction,
 		"approx_kl": approx_kl,
+		"explained_variance": explained_var,
+		"entropy_action_type": at_entropy_mean,
+		"entropy_play_start": ps_entropy_mean,
+		"entropy_play_end": pe_entropy_mean,
+		"entropy_scout_insert": si_entropy_mean,
+		"entropy_floor_penalty": floor_penalty_val,
+	}
+
+def direct_pg_update(network: ScoutNetwork, optimizer: torch.optim.Optimizer,
+					 batch: dict, entropy_bonus: float = 0.01,
+					 value_loss_coeff: float = 0.25, max_grad_norm: float = 0.5,
+					 entropy_floors: dict[str, float] | None = None,
+					 entropy_floor_coeff: float = 1.0,
+					 play_start_size: int = PLAY_START_SIZE):
+	"""Vanilla policy gradient update: loss = -log_prob(action) * advantage.
+	No importance sampling, no clipping. Should be called for 1 epoch only.
+	Takes the same batch format as ppo_update."""
+	empty_metrics = {
+		"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+		"clip_fraction": 0.0, "approx_kl": 0.0, "explained_variance": 0.0,
+		"entropy_action_type": 0.0, "entropy_play_start": 0.0,
+		"entropy_play_end": 0.0, "entropy_scout_insert": 0.0,
+		"entropy_floor_penalty": 0.0,
+	}
+	if batch is None:
+		return empty_metrics
+
+	n = batch["n"]
+
+	# Batched forward pass through shared layers
+	hidden_all = network(batch["states"])  # [n, hidden_size]
+
+	# Value loss (all steps)
+	v_pred = network.value(hidden_all).squeeze(-1)  # [n]
+	v_target = batch["v_target"]
+	value_loss = F.mse_loss(v_pred, v_target)
+
+	# Action type log probs
+	at_logits = network.action_type_logits(hidden_all)  # [n, AT_SIZE]
+	at_masks = batch["at_masks"]
+	at_actions = batch["at_actions"]
+
+	log_prob = _batched_masked_log_prob(at_logits, at_masks, at_actions)
+	at_ent = _batched_masked_entropy(at_logits, at_masks)
+	entropy = at_ent.clone()
+
+	def _filtered_ent_mean(ent, masks):
+		has_choice = masks.sum(dim=-1) >= 2
+		if has_choice.any():
+			return ent[has_choice].mean().item()
+		return 0.0
+
+	at_entropy_mean = _filtered_ent_mean(at_ent, at_masks)
+	ps_entropy_mean = 0.0
+	pe_entropy_mean = 0.0
+	si_entropy_mean = 0.0
+	_head_ent = {"action_type": (at_ent, at_masks)}
+	_head_ent["play_start"] = None
+	_head_ent["play_end"] = None
+	_head_ent["scout_insert"] = None
+
+	# Play start
+	if "play_idx" in batch:
+		idx_t = batch["play_idx"]
+		cond = _build_batch_conditioning(hidden_all[idx_t], batch["play_at"], None, play_start_size=play_start_size)
+		logits = network.play_start_head(cond)
+		masks = batch["play_masks"]
+		actions = batch["play_actions"]
+		lp = _batched_masked_log_prob(logits, masks, actions)
+		ps_ent = _batched_masked_entropy(logits, masks)
+		log_prob = log_prob + torch.zeros(n).scatter(0, idx_t, lp)
+		entropy = entropy + torch.zeros(n).scatter(0, idx_t, ps_ent)
+		ps_entropy_mean = _filtered_ent_mean(ps_ent, masks)
+		_head_ent["play_start"] = (ps_ent, masks)
+
+	# Play end
+	if "end_idx" in batch:
+		idx_t = batch["end_idx"]
+		cond = _build_batch_conditioning(hidden_all[idx_t], batch["end_at"], batch["end_starts"], play_start_size=play_start_size)
+		logits = network.play_end_head(cond)
+		masks = batch["end_masks"]
+		actions = batch["end_actions"]
+		lp = _batched_masked_log_prob(logits, masks, actions)
+		pe_ent = _batched_masked_entropy(logits, masks)
+		log_prob = log_prob + torch.zeros(n).scatter(0, idx_t, lp)
+		entropy = entropy + torch.zeros(n).scatter(0, idx_t, pe_ent)
+		pe_entropy_mean = _filtered_ent_mean(pe_ent, masks)
+		_head_ent["play_end"] = (pe_ent, masks)
+
+	# Scout insert
+	if "scout_idx" in batch:
+		idx_t = batch["scout_idx"]
+		cond = _build_batch_conditioning(hidden_all[idx_t], batch["scout_at"], None, play_start_size=play_start_size)
+		logits = network.scout_insert_head(cond)
+		masks = batch["scout_masks"]
+		actions = batch["scout_actions"]
+		lp = _batched_masked_log_prob(logits, masks, actions)
+		si_ent = _batched_masked_entropy(logits, masks)
+		log_prob = log_prob + torch.zeros(n).scatter(0, idx_t, lp)
+		entropy = entropy + torch.zeros(n).scatter(0, idx_t, si_ent)
+		si_entropy_mean = _filtered_ent_mean(si_ent, masks)
+		_head_ent["scout_insert"] = (si_ent, masks)
+
+	# Vanilla policy gradient: -log_prob * advantage
+	adv = batch["adv"]
+	policy_loss = -(log_prob * adv).mean()
+
+	loss = policy_loss + value_loss_coeff * value_loss - entropy_bonus * entropy.mean()
+
+	# Entropy floor penalty (same as PPO)
+	floor_penalty_val = 0.0
+	if entropy_floors:
+		floor_penalty = torch.tensor(0.0)
+		for key, pair in _head_ent.items():
+			floor = entropy_floors.get(key, 0.0)
+			if floor <= 0 or pair is None:
+				continue
+			ent_tensor, mask_tensor = pair
+			has_choice = mask_tensor.sum(dim=-1) >= 2
+			if not has_choice.any():
+				continue
+			mean_ent = ent_tensor[has_choice].mean()
+			violation = torch.clamp(floor - mean_ent, min=0.0)
+			floor_penalty = floor_penalty + violation ** 2
+		loss = loss + entropy_floor_coeff * floor_penalty
+		floor_penalty_val = floor_penalty.item()
+
+	if torch.isnan(loss):
+		print(f"  WARNING: NaN loss detected (policy={policy_loss.item()}, value={value_loss.item()}, entropy={entropy.mean().item()})")
+		return empty_metrics
+
+	optimizer.zero_grad()
+	loss.backward()
+	torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=max_grad_norm)
+	optimizer.step()
+
+	# Diagnostics
+	with torch.no_grad():
+		var_returns = v_target.var()
+		if var_returns < 1e-8:
+			explained_var = 0.0
+		else:
+			explained_var = (1 - (v_target - v_pred.detach()).var() / var_returns).item()
+
+	return {
+		"policy_loss": policy_loss.item(),
+		"value_loss": value_loss.item(),
+		"entropy": entropy.mean().item(),
+		"mean_ratio": 1.0,  # no importance sampling
+		"clip_fraction": 0.0,  # no clipping
+		"approx_kl": 0.0,  # no old policy comparison
 		"explained_variance": explained_var,
 		"entropy_action_type": at_entropy_mean,
 		"entropy_play_start": ps_entropy_mean,
