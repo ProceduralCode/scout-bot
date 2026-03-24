@@ -8,3 +8,5 @@ build/
 runs/
 output/
 v*/
+!v*/charts.png
+!v*/summary.txt
