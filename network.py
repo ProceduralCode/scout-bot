@@ -6,6 +6,7 @@ from encoding import (
 	INPUT_SIZE, ACTION_TYPE_SIZE, PLAY_START_SIZE, PLAY_END_SIZE, SCOUT_INSERT_SIZE,
 	CNN_CHANNELS_V4, HAND_SLOTS_V4, FLAT_SIZE_V4, CNN_FLAT_SIZE_V4, INPUT_SIZE_V4,
 	PLAY_START_SIZE_V4, PLAY_END_SIZE_V4, SCOUT_INSERT_SIZE_V4,
+	FLAT_ACTION_SIZE,
 )
 
 def build_conditioning(hidden: Tensor, action_type_idx: int | None, start_idx: int | None,
@@ -195,6 +196,42 @@ class CircularCNNScoutNetwork(nn.Module):
 		conditioned = build_conditioning(hidden, action_type, None, self.play_start_size)
 		return self.scout_insert_head(conditioned)
 
+class FlatScoutNetwork(nn.Module):
+	"""V6 network: flat policy head over 384 actions. No conditioning or sequential heads."""
+
+	def __init__(self, input_size: int, layer_sizes: list[int] | None = None,
+				 encoding_version: int = 6):
+		super().__init__()
+		if layer_sizes is None:
+			layer_sizes = [512, 256, 256, 128, 128, 128]
+		self.layer_sizes = layer_sizes
+		self.encoding_version = encoding_version
+
+		# Shared trunk (same builder as ScoutNetwork)
+		layers = []
+		prev_size = input_size
+		for size in layer_sizes:
+			if size == prev_size:
+				layers.append(ResidualBlock(size))
+			else:
+				layers.append(nn.Linear(prev_size, size))
+				layers.append(nn.ReLU())
+			prev_size = size
+		self.shared = nn.Sequential(*layers)
+
+		output_size = layer_sizes[-1]
+		self.value_head = nn.Linear(output_size, 1)
+		self.policy_head = nn.Linear(output_size, FLAT_ACTION_SIZE)
+
+	def forward(self, x: Tensor) -> Tensor:
+		return self.shared(x)
+
+	def value(self, hidden: Tensor) -> Tensor:
+		return self.value_head(hidden)
+
+	def policy_logits(self, hidden: Tensor) -> Tensor:
+		return self.policy_head(hidden)
+
 class RandomBot:
 	"""Bot that plays uniformly random legal actions. For evaluation baseline.
 	Duck-types ScoutNetwork: zero logits → uniform distribution after masking."""
@@ -227,6 +264,9 @@ class RandomBot:
 
 	def scout_insert_logits(self, hidden: Tensor, action_type: int) -> Tensor:
 		return torch.zeros(self._scout_insert_size)
+
+	def policy_logits(self, hidden: Tensor) -> Tensor:
+		return torch.zeros(FLAT_ACTION_SIZE)
 
 def batched_masked_sample(logits: Tensor, mask: Tensor) -> Tensor:
 	"""Gumbel-max sampling for a batch. logits/mask: [B, C] → [B] LongTensor."""

@@ -9,72 +9,121 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from encoding import (
-	INPUT_SIZE, INPUT_SIZE_V2,
+	INPUT_SIZE, INPUT_SIZE_V2, INPUT_SIZE_V6,
 	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, SCOUT_INSERT_SIZE_V2,
 )
-from network import ScoutNetwork, RandomBot
-from training import play_game, play_games_batched, play_games_with_rollouts, play_eval_game, OpponentPool, compute_gae, prepare_ppo_batch, concatenate_batches, ppo_update, direct_pg_update
+from network import ScoutNetwork, FlatScoutNetwork, RandomBot
+from training import (
+	play_game, play_games_batched, play_games_with_rollouts, play_eval_game,
+	OpponentPool, compute_gae,
+	prepare_ppo_batch, subsample_batch, concatenate_batches, ppo_update, direct_pg_update,
+	play_games_with_rollouts_v6, prepare_ppo_batch_v6, subsample_batch_v6,
+	concatenate_batches_v6, ppo_update_v6, augment_rotation_v6,
+)
 from game_log import GameLog
 from probe import eval_scout_quality
 
 PARAMS = {
 	"num_players": 4,
-	# "layer_sizes": [256, 128],  # old shallow network
-	"layer_sizes": [512, 256, 256, 128, 128, 128],
-	# "learning_rate": 0.0001, # didn't help
-	"learning_rate": 0.0003, # base
-	# "learning_rate": 0.0006, # seems slightly worse
-	# "learning_rate": 0.001, # too much
-	# "learning_rate": 0.003, # too much
-	# "batch_size": 256,  # TODO: implement mini-batching within PPO epochs
-	"games_per_iteration": 400,
-	# "ppo_epochs": 4, # passes over the batch per iteration
+	"layer_sizes": [512, 256, 128],
+	"learning_rate": 0.0003,
+	"games_per_iteration": 400,  # used in GAE mode only
 	"ppo_epochs": 8,
-	"replay_buffer_size": 20,  # keep last N iterations of data for PPO (1 = no buffer)
+	"replay_past": [200, 100, 50, 50, 50],
 	"clip_epsilon": 0.2,
 	"entropy_bonus": 0.01,
-	# "entropy_bonus": 0.05,
-	# "entropy_bonus": 0.25,
-	"entropy_floors": {
-		"action_type": 0.05,
-		"play_start": 0.05,
-		"play_end": 0.05, # 91% of steps have 1 option; floor targets the 9% with 2+
-		"scout_insert": 0.05,
-	},
+	"entropy_floors": None,  # v6: no per-head floors (flat head)
 	"entropy_floor_coeff": 1.0,
-	"reward_mode": "game_score",  # "game_score", "play_length", or "play_and_scout"
-	"reward_distribution": 0.7,  # "terminal", "uniform", or 0-1 uniform fraction (game_score mode only)
-	# Used this for a while to start training like 2,000 iterations and then turned it off.
-	# "shaped_bonus_scale": 0.05,  # per-action bonus for play_length and scout_quality
-	"shaped_bonus_scale": 0,  # per-action bonus for play_length and scout_quality
+	"reward_mode": "game_score",
+	"reward_distribution": 0.7,
+	"shaped_bonus_scale": 0,
 	"value_loss_coeff": 0.25,
 	"gamma": 0.99,
 	"gae_lambda": 0.95,
 	"training_seats": 4,
 	"opponent_pool_size": 10,
-	"snapshot_interval": 30, # add to pool every N iterations
+	"snapshot_interval": 30,
 	"total_iterations": 1_000_000,
 	"log_interval": 1,
 	"save_interval": 1000,
-	# "save_interval": 100,
-	# "eval_interval": 30,
 	"eval_interval": 5,
-	"encoding_version": 2,
-	# "encoding_version": 4,
-	# Rollout-based advantage estimation (replaces GAE)
+	"encoding_version": 6,
+	"num_values": 10,
 	"use_rollouts": True,
-	"rollout_games": 10,  # real games per iteration (rollouts are per-state within these)
-	"rollouts_per_state": 50,  # N rollout games from each decision point
-	"use_direct_pg": False,  # vanilla policy gradient instead of PPO (forces 1 epoch)
-	"save_dir": "v5_5",
+	"rollout_games": 10,
+	"rollouts_per_state": 50,
+	"augment_rotations": 16,  # 1 = no augmentation, 16 = all rotations
+	"use_direct_pg": False,
+	"save_dir": "v6",
 	"eval_opponents": {
-		# "random": "random", # magic word → uses RandomBot
 		"v1_4": "v1_4/latest.pt",
 		"v2_5": "v2_5/latest.pt",
 		"v3_4": "v3_4/latest.pt",
 		"v4_2": "v4_2/latest.pt",
-	}, # name → checkpoint path (or "random" for RandomBot)
+	},
 }
+
+# PARAMS = {
+# 	"num_players": 4,
+# 	# "layer_sizes": [256, 128],  # old shallow network
+# 	"layer_sizes": [512, 256, 128, 128],
+# 	# "layer_sizes": [512, 256, 256, 128, 128, 128],
+# 	# "learning_rate": 0.0001, # didn't help
+# 	"learning_rate": 0.0003, # base
+# 	# "learning_rate": 0.0006, # seems slightly worse
+# 	# "learning_rate": 0.001, # too much
+# 	# "learning_rate": 0.003, # too much
+# 	# "batch_size": 256,  # TODO: implement mini-batching within PPO epochs
+# 	"games_per_iteration": 400,
+# 	# "ppo_epochs": 4, # passes over the batch per iteration
+# 	"ppo_epochs": 8,
+# 	"replay_past": [200, 100, 50, 50, 50],  # samples from past iterations ([] = no buffer)
+# 	# "replay_past": [],
+# 	"clip_epsilon": 0.2,
+# 	"entropy_bonus": 0.01,
+# 	# "entropy_bonus": 0.05,
+# 	# "entropy_bonus": 0.25,
+# 	"entropy_floors": {
+# 		"action_type": 0.05,
+# 		"play_start": 0.05,
+# 		"play_end": 0.05, # 91% of steps have 1 option; floor targets the 9% with 2+
+# 		"scout_insert": 0.05,
+# 	},
+# 	"entropy_floor_coeff": 1.0,
+# 	"reward_mode": "game_score",  # "game_score", "play_length", or "play_and_scout"
+# 	"reward_distribution": 0.7,  # "terminal", "uniform", or 0-1 uniform fraction (game_score mode only)
+# 	# Used this for a while to start training like 2,000 iterations and then turned it off.
+# 	# "shaped_bonus_scale": 0.05,  # per-action bonus for play_length and scout_quality
+# 	"shaped_bonus_scale": 0,  # per-action bonus for play_length and scout_quality
+# 	"value_loss_coeff": 0.25,
+# 	"gamma": 0.99,
+# 	"gae_lambda": 0.95,
+# 	"training_seats": 4,
+# 	"opponent_pool_size": 10,
+# 	"snapshot_interval": 30, # add to pool every N iterations
+# 	"total_iterations": 1_000_000,
+# 	"log_interval": 1,
+# 	"save_interval": 1000,
+# 	# "save_interval": 100,
+# 	# "eval_interval": 30,
+# 	"eval_interval": 5,
+# 	"encoding_version": 2,
+# 	# "encoding_version": 4,
+# 	# Rollout-based advantage estimation (replaces GAE)
+# 	# "use_rollouts": True,
+# 	"use_rollouts": False,
+# 	"rollout_games": 10,  # real games per iteration (rollouts are per-state within these)
+# 	"rollouts_per_state": 50,  # N rollout games from each decision point
+# 	"use_direct_pg": False,  # vanilla policy gradient instead of PPO (forces 1 epoch)
+# 	"save_dir": "temp",
+# 	"eval_opponents": {
+# 		# "random": "random", # magic word → uses RandomBot
+# 		"v1_4": "v1_4/latest.pt",
+# 		"v2_5": "v2_5/latest.pt",
+# 		"v3_4": "v3_4/latest.pt",
+# 		"v4_2": "v4_2/latest.pt",
+# 	}, # name → checkpoint path (or "random" for RandomBot)
+# }
 
 def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, filename, pool=None, extra=None):
 	path = os.path.join(save_dir, filename)
@@ -250,13 +299,21 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 			"PPO clipped surrogate loss. Watch for instability (spikes or divergence).", "#ff6b6b")
 		plot_line(axes[2, 1], "value_loss", "Value Loss",
 			"MSE between predicted and actual returns. Should decrease as value function improves.", "#ffa552")
-		plot_multi(axes[2, 2], [
-			("entropy_action_type", "Action Type", "#69db7c"),
-			("entropy_play_start", "Play Start", "#5dadec"),
-			("entropy_play_end", "Play End", "#ffa552"),
-			("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
-		], "Per-Head Entropy",
-			"Entropy per head (steps with 2+ options only). Collapsing = premature convergence. Compare to floors in config.")
+		if "entropy_play" in trimmed and trimmed["entropy_play"]:
+			plot_multi(axes[2, 2], [
+				("entropy", "Total", "#69db7c"),
+				("entropy_play", "Play Only", "#5dadec"),
+				("entropy_scout", "Scout Only", "#ff6b6b"),
+			], "Conditional Entropies",
+				"Flat-head entropy. Play/Scout are conditional on masking other regions. Low = converging.")
+		else:
+			plot_multi(axes[2, 2], [
+				("entropy_action_type", "Action Type", "#69db7c"),
+				("entropy_play_start", "Play Start", "#5dadec"),
+				("entropy_play_end", "Play End", "#ffa552"),
+				("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
+			], "Per-Head Entropy",
+				"Entropy per head (steps with 2+ options only). Collapsing = premature convergence.")
 		plot_line(axes[2, 3], "entropy_floor_penalty", "Entropy Floor Penalty",
 			"Quadratic penalty when head entropy drops below floor. >0 = floor active. 0 = heads above floor.", "#ff922b")
 
@@ -323,7 +380,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 	save_dir = cfg["save_dir"]
 	os.makedirs(save_dir, exist_ok=True)
 	ev = cfg.get("encoding_version", 1)
-	if ev == 2:
+	if ev == 6:
+		network = FlatScoutNetwork(INPUT_SIZE_V6, cfg["layer_sizes"], encoding_version=6)
+	elif ev == 2:
 		network = ScoutNetwork(INPUT_SIZE_V2, cfg["layer_sizes"],
 			play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
 			scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
@@ -337,6 +396,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		"entropy_action_type": [], "entropy_play_start": [],
 		"entropy_play_end": [], "entropy_scout_insert": [],
 		"entropy_floor_penalty": [],
+		"entropy_play": [], "entropy_scout": [],
 		"play_pct": [], "scout_pct": [], "sns_pct": [],
 		"steps_per_game": [],
 		"avg_play_length": [], "reward_std": [],
@@ -397,7 +457,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			else:
 				ls = [ckpt_cfg.get("first_hidden_size", 256), ckpt_cfg.get("hidden_size", 128)]
 			eval_ev = ckpt_cfg.get("encoding_version", 1)
-			if eval_ev == 2:
+			if eval_ev == 6:
+				eval_net = FlatScoutNetwork(INPUT_SIZE_V6, ls, encoding_version=6)
+			elif eval_ev == 2:
 				eval_net = ScoutNetwork(INPUT_SIZE_V2, ls,
 					play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
 					scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
@@ -410,11 +472,13 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		key = f"eval_margin_{name}"
 		if key not in metrics_history:
 			metrics_history[key] = []
-	input_size = INPUT_SIZE_V2 if ev == 2 else INPUT_SIZE
+	input_size = INPUT_SIZE_V6 if ev == 6 else INPUT_SIZE_V2 if ev == 2 else INPUT_SIZE
 	print(f"Training Scout bot: {cfg['num_players']} players, "
 		  f"input_size={input_size}, encoding=v{ev}, layers={cfg['layer_sizes']}")
+	rp = cfg.get("replay_past", [])
+	replay_str = f", replay_past={rp}" if rp else ""
 	print(f"Games/iter={cfg['games_per_iteration']}, "
-		  f"PPO epochs={cfg['ppo_epochs']}")
+		  f"PPO epochs={cfg['ppo_epochs']}{replay_str}")
 	print(f"Output: {save_dir}/")
 	profiler = None
 	if profile_iters:
@@ -424,20 +488,32 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		print(f"\nProfiling {profile_iters} iterations ({start_iter} to {profile_stop - 1})...")
 		profiler.start()
 	iteration = start_iter
-	replay_buffer = deque(maxlen=cfg.get("replay_buffer_size", 1))
+	replay_past = cfg.get("replay_past", [])
+	replay_buffer = deque(maxlen=len(replay_past) + 1) if replay_past else None
 	try:
 		for iteration in range(start_iter, cfg["total_iterations"] + 1):
 			t0 = time.time()
 			# Self-play: collect games and compute advantages
 			network.eval()
-			if cfg.get("use_rollouts"):
+			if ev == 6:
+				iteration_records, advantages = play_games_with_rollouts_v6(
+					network, cfg.get("rollout_games", 10), cfg["num_players"],
+					rollouts_per_state=cfg.get("rollouts_per_state", 50),
+					training_seats=cfg["training_seats"])
+				original_records = iteration_records  # pre-augmentation copy for metrics
+				if cfg.get("augment_rotations", 1) > 1:
+					iteration_records, advantages = augment_rotation_v6(
+						iteration_records, advantages, network)
+				returns = None  # prepare_ppo_batch_v6 uses record.value
+				adv_std_val = 1.0
+			elif cfg.get("use_rollouts"):
 				iteration_records, advantages = play_games_with_rollouts(
 					network, cfg.get("rollout_games", 40), cfg["num_players"],
 					rollouts_per_state=cfg.get("rollouts_per_state", 10),
 					training_seats=cfg["training_seats"])
-				# Value targets: use rollout V estimates stored in record.value
+				original_records = iteration_records
 				returns = [r.value for r in iteration_records]
-				adv_std_val = 1.0  # already normalized
+				adv_std_val = 1.0
 			else:
 				iteration_records = play_games_batched(
 					network, cfg["games_per_iteration"], cfg["num_players"],
@@ -446,10 +522,11 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					reward_distribution=cfg.get("reward_distribution", "terminal"),
 					reward_mode=cfg.get("reward_mode", "game_score"),
 					shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0))
+				original_records = iteration_records
 				advantages, returns, adv_std_val = compute_gae(
 					iteration_records, gamma=cfg["gamma"], lam=cfg["gae_lambda"])
 			play_time = time.time() - t0
-			if any(math.isnan(r.value) for r in iteration_records):
+			if any(math.isnan(r.value) for r in original_records):
 				print(f"[iter {iteration:>5}] WARNING: NaN in forward pass, skipping update")
 				continue
 			# PPO training — on-policy, all steps from this iteration
@@ -457,18 +534,40 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			# LR annealing: linear decay to 0
 			lr = cfg["learning_rate"] * (1 - iteration / cfg["total_iterations"])
 			optimizer.param_groups[0]["lr"] = lr
-			batch = prepare_ppo_batch(iteration_records, advantages, returns=returns)
 			use_dpg = cfg.get("use_direct_pg", False)
-			# Replay buffer: accumulate batches for PPO (not used with direct PG)
-			if not use_dpg and batch is not None:
-				replay_buffer.append(batch)
-				training_batch = concatenate_batches(list(replay_buffer))
+			if ev == 6:
+				batch = prepare_ppo_batch_v6(iteration_records, advantages)
+				if batch is not None and replay_buffer is not None:
+					replay_buffer.append(batch)
+					buf = list(replay_buffer)
+					sampled = [buf[-1]]
+					for i, b in enumerate(reversed(buf[:-1])):
+						sampled.append(subsample_batch_v6(b, replay_past[i]))
+					training_batch = concatenate_batches_v6(sampled)
+				else:
+					training_batch = batch
 			else:
-				training_batch = batch
+				batch = prepare_ppo_batch(iteration_records, advantages, returns=returns)
+				if not use_dpg and batch is not None and replay_buffer is not None:
+					replay_buffer.append(batch)
+					buf = list(replay_buffer)
+					sampled = [buf[-1]]
+					for i, b in enumerate(reversed(buf[:-1])):
+						sampled.append(subsample_batch(b, replay_past[i]))
+					training_batch = concatenate_batches(sampled)
+				else:
+					training_batch = batch
 			n_epochs = 1 if use_dpg else cfg["ppo_epochs"]
 			ppo_sums = {}
 			for epoch in range(n_epochs):
-				if use_dpg:
+				if ev == 6:
+					m = ppo_update_v6(
+						network, optimizer, training_batch,
+						clip_epsilon=cfg["clip_epsilon"],
+						entropy_bonus=cfg["entropy_bonus"],
+						value_loss_coeff=cfg["value_loss_coeff"],
+					)
+				elif use_dpg:
 					m = direct_pg_update(
 						network, optimizer, training_batch,
 						entropy_bonus=cfg["entropy_bonus"],
@@ -488,7 +587,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 						play_start_size=network.play_start_size,
 					)
 					# Epoch 0: ratios must be ~1.0 (stale buffer data shifts this)
-					if epoch == 0 and len(replay_buffer) <= 1 and abs(m["mean_ratio"] - 1.0) > 0.01:
+					if epoch == 0 and (not replay_buffer or len(replay_buffer) <= 1) and abs(m["mean_ratio"] - 1.0) > 0.01:
 						print(f"  WARNING: epoch 0 mean ratio={m['mean_ratio']:.4f} (expected ~1.0)")
 				for k, v in m.items():
 					ppo_sums[k] = ppo_sums.get(k, 0.0) + v
@@ -499,7 +598,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				pool.add(network)
 			# Logging + metrics + latest save
 			if iteration % cfg["log_interval"] == 0:
-				p0_records = [r for r in iteration_records if r.player == 0]
+				# Use original (pre-augmentation) records for behavioral metrics
+				metric_records = original_records
+				p0_records = [r for r in metric_records if r.player == 0]
 				# Per-round reward: sum steps within each round so metric is
 				# comparable across terminal vs uniform reward distribution
 				round_totals: dict[tuple[int,int], float] = {}
@@ -510,17 +611,22 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				avg_reward = sum(p0_rewards) / max(len(p0_rewards), 1)
 				reward_std = (sum((r - avg_reward)**2 for r in p0_rewards) / max(len(p0_rewards), 1)) ** 0.5
 				avg_value = sum(r.value for r in p0_records) / max(len(p0_records), 1)
-				# Behavioral metrics
-				n_steps = len(iteration_records)
-				n_play = sum(1 for r in iteration_records if r.action_type == 0)
-				n_scout = sum(1 for r in iteration_records if 1 <= r.action_type <= 4)
-				n_sns = sum(1 for r in iteration_records if 5 <= r.action_type <= 8)
+				# Behavioral metrics (from original records, not augmented)
+				n_steps = len(metric_records)
+				if ev == 6:
+					n_play = sum(1 for r in metric_records if r.action < 256)
+					n_scout = sum(1 for r in metric_records if 256 <= r.action < 320)
+					n_sns = sum(1 for r in metric_records if r.action >= 320)
+				else:
+					n_play = sum(1 for r in metric_records if r.action_type == 0)
+					n_scout = sum(1 for r in metric_records if 1 <= r.action_type <= 4)
+					n_sns = sum(1 for r in metric_records if 5 <= r.action_type <= 8)
 				play_pct = n_play / max(n_steps, 1)
 				scout_pct = n_scout / max(n_steps, 1)
 				sns_pct = n_sns / max(n_steps, 1)
-				num_games = cfg["rollout_games"] if cfg.get("use_rollouts") else cfg["games_per_iteration"]
+				num_games = cfg["rollout_games"] if cfg.get("use_rollouts") or ev == 6 else cfg["games_per_iteration"]
 				steps_per_game = n_steps / num_games
-				play_lengths = [r.play_length for r in iteration_records if r.play_length is not None]
+				play_lengths = [r.play_length for r in metric_records if r.play_length is not None]
 				avg_play_length = sum(play_lengths) / max(len(play_lengths), 1)
 				n_plays = max(len(play_lengths), 1)
 				play_len_counts = [0] * 8 # indices 1-7, 0 unused
@@ -530,12 +636,18 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				metrics_history["iteration"].append(iteration)
 				metrics_history["reward"].append(avg_reward)
 				metrics_history["value"].append(avg_value)
-				for k in ("policy_loss", "value_loss", "entropy",
-						  "clip_fraction", "approx_kl", "explained_variance",
-						  "entropy_action_type", "entropy_play_start",
-						  "entropy_play_end", "entropy_scout_insert",
-						  "entropy_floor_penalty"):
-					metrics_history[k].append(ppo_avg[k])
+				if ev == 6:
+					for k in ("policy_loss", "value_loss", "entropy",
+							  "clip_fraction", "approx_kl", "explained_variance",
+							  "entropy_play", "entropy_scout"):
+						metrics_history[k].append(ppo_avg.get(k, 0.0))
+				else:
+					for k in ("policy_loss", "value_loss", "entropy",
+							  "clip_fraction", "approx_kl", "explained_variance",
+							  "entropy_action_type", "entropy_play_start",
+							  "entropy_play_end", "entropy_scout_insert",
+							  "entropy_floor_penalty"):
+						metrics_history[k].append(ppo_avg[k])
 				metrics_history["play_pct"].append(play_pct)
 				metrics_history["scout_pct"].append(scout_pct)
 				metrics_history["sns_pct"].append(sns_pct)
@@ -545,7 +657,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
 				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
 				metrics_history["reward_std"].append(reward_std)
-				buf_str = f"({training_batch['n']})" if training_batch and len(replay_buffer) > 1 else ""
+				buf_str = f"({training_batch['n']})" if training_batch and replay_buffer and len(replay_buffer) > 1 else ""
 				print(f"[iter {iteration:>5}] "
 					  f"reward={avg_reward:+.3f}  value={avg_value:+.3f}  "
 					  f"ploss={ppo_avg['policy_loss']:.4f}  vloss={ppo_avg['value_loss']:.4f}  "

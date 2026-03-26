@@ -571,6 +571,34 @@ def _sample_scout(network, game, player=1):
 	card = play_cards[0]  # left end, no flip
 	action_type = 1  # scout-left-normal
 	ev = getattr(network, 'encoding_version', 1)
+	if ev == 6:
+		# V6: sample a scout action from the flat head
+		from encoding import (encode_state_v6, get_flat_action_mask, decode_flat_action,
+							  HAND_SLOTS_V6)
+		H = HAND_SLOTS_V6
+		ho = random.randint(0, H - 1)
+		legal_plays = get_legal_plays(hand, game.current_play)
+		state = encode_state_v6(game, player, ho)
+		mask = get_flat_action_mask(game, player, legal_plays, ho)
+		# Restrict to scout region only (256-319)
+		scout_mask = mask.clone()
+		scout_mask[:256] = False
+		scout_mask[320:] = False
+		if not scout_mask.any():
+			return None
+		with torch.no_grad():
+			hidden = network(state)
+			logits = network.policy_logits(hidden)
+			action_idx, _ = masked_sample(logits, scout_mask)
+		action = decode_flat_action(action_idx, ho)
+		left_end, flip = action['left_end'], action['flip']
+		scouted = play_cards[0] if left_end else play_cards[-1]
+		if flip:
+			scouted = (scouted[1], scouted[0])
+		return {
+			"hand": list(hand), "card": scouted,
+			"insert_pos": action['insert_pos'],
+		}
 	if ev == 4:
 		_hs = HAND_SLOTS_V4
 		_sis = SCOUT_INSERT_SIZE_V4

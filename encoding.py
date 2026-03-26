@@ -738,6 +738,283 @@ def decode_slot_to_hand_index(slot: int, hand_offset: int, num_slots: int = HAND
 	"""Convert an encoded slot position back to a raw hand index."""
 	return (slot - hand_offset) % num_slots
 
+# --- V6 encoding: flat action space, circular hand, scalar play buffers ---
+
+HAND_SLOTS_V6 = 16
+NUM_VALUES_V6 = 10
+_N6 = NUM_VALUES_V6
+_H6 = HAND_SLOTS_V6
+HAND_DIM_V6 = _H6 * (_N6 + 2) + _H6           # 208
+SCOUT_CARDS_DIM_V6 = 4 * (_N6 + 1)             # 44
+PLAY_BUFFER_DIM_V6 = 16 + 5                     # 21
+METADATA_DIM_V6 = 28
+INPUT_SIZE_V6 = HAND_DIM_V6 + SCOUT_CARDS_DIM_V6 + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6  # 301
+FLAT_ACTION_SIZE = 384  # 256 play + 64 scout + 64 S&S
+
+def _fill_hand_v6(buf, offset, hand, hand_offset, N, H):
+	"""Write H slots, each N+2 dims: N one-hot top value + empty flag + top scalar."""
+	slot_size = N + 2
+	# Initialize all slots to empty
+	for s in range(H):
+		buf[offset + s * slot_size + N] = 1.0
+	for i, card in enumerate(hand):
+		slot = (hand_offset + i) % H
+		pos = offset + slot * slot_size
+		buf[pos + N] = 0.0                 # clear empty flag
+		buf[pos + card[0] - 1] = 1.0       # one-hot top value (1-indexed → 0-indexed)
+		buf[pos + N + 1] = card[0] / N     # top scalar
+
+def _fill_hand_bottom_v6(buf, offset, hand, hand_offset, N, H):
+	"""Write H bottom face scalars (value/N, 0 if empty)."""
+	for i, card in enumerate(hand):
+		slot = (hand_offset + i) % H
+		buf[offset + slot] = card[1] / N
+
+def _fill_scout_cards_v6(buf, offset, current_play, N):
+	"""Write 4 scout card options, each N+1 dims: N one-hot face + absent flag.
+	Order: left normal, left flipped, right normal, right flipped."""
+	card_size = N + 1
+	if current_play is None:
+		for c in range(4):
+			buf[offset + c * card_size + N] = 1.0  # all absent
+		return
+	cards = current_play.cards
+	left = cards[0]
+	buf[offset + left[0] - 1] = 1.0                       # left normal: top face
+	buf[offset + card_size + left[1] - 1] = 1.0           # left flipped: bottom face
+	if len(cards) > 1:
+		right = cards[-1]
+		buf[offset + 2 * card_size + right[0] - 1] = 1.0  # right normal: top face
+		buf[offset + 3 * card_size + right[1] - 1] = 1.0  # right flipped: bottom face
+	else:
+		buf[offset + 2 * card_size + N] = 1.0              # right normal: absent
+		buf[offset + 3 * card_size + N] = 1.0              # right flipped: absent
+
+def _fill_play_buffer_v6(buf, offset, current_play, N):
+	"""Write two 4-card buffers (top+bottom scalars /N) + play metadata.
+	Left-aligned (right-padded), right-aligned (left-padded). Total: 21 dims."""
+	if current_play is None:
+		buf[offset + 16] = 1.0  # no_play type
+		return
+	cards = current_play.cards
+	L = len(cards)
+	# Left-aligned: first min(4, L) cards
+	for i in range(min(4, L)):
+		buf[offset + i * 2] = cards[i][0] / N
+		buf[offset + i * 2 + 1] = cards[i][1] / N
+	# Right-aligned: last min(4, L) cards, right-padded to position 3
+	for i in range(min(4, L)):
+		card_idx = L - 1 - i
+		buf_idx = 3 - i
+		buf[offset + 8 + buf_idx * 2] = cards[card_idx][0] / N
+		buf[offset + 8 + buf_idx * 2 + 1] = cards[card_idx][1] / N
+	# Play metadata: type (3 one-hot) + strength/N + length/10
+	meta = offset + 16
+	if current_play.play_type == PlayType.SET:
+		buf[meta + 1] = 1.0
+	else:
+		buf[meta + 2] = 1.0
+	buf[meta + 3] = current_play.strength / N
+	buf[meta + 4] = current_play.count / 10.0
+
+def _fill_metadata_v6(buf, offset, game, player, forced_play, H):
+	"""Write v6 metadata (28 dims): hand/collected/tokens + player_count scalar + forced flag."""
+	n = game.num_players
+	players = game.players
+	i = offset
+	buf[i] = len(players[player].hand) / H; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].hand) / H
+		i += 1
+	buf[i] = len(players[player].collected) / H; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = len(players[(player + 1 + j) % n].collected) / H
+		i += 1
+	buf[i] = players[player].scout_tokens / 5.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = players[(player + 1 + j) % n].scout_tokens / 5.0
+		i += 1
+	buf[i] = 1.0 if players[player].sns_available else 0.0; i += 1
+	for j in range(4):
+		if j < n - 1:
+			buf[i] = 1.0 if players[(player + 1 + j) % n].sns_available else 0.0
+		i += 1
+	buf[i] = n / 5.0; i += 1
+	buf[i] = game.scouts_since_play / max(n - 1, 1); i += 1
+	owner_rel = (game.current_play_owner - player) % n if game.current_play_owner is not None else None
+	for dist in range(5):
+		buf[i] = 1.0 if owner_rel == dist else 0.0; i += 1
+	buf[i] = 1.0 if forced_play else 0.0
+
+def encode_state_v6(game, player, hand_offset, forced_play=False):
+	"""V6 state encoding: circular hand + scout cards + play buffers + metadata."""
+	N = game.num_values
+	H = HAND_SLOTS_V6
+	buf = np.zeros(H * (N + 2) + H + 4 * (N + 1) + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6,
+		dtype=np.float32)
+	hand = game.players[player].hand
+	off = 0
+	_fill_hand_v6(buf, off, hand, hand_offset, N, H)
+	off += H * (N + 2)
+	_fill_hand_bottom_v6(buf, off, hand, hand_offset, N, H)
+	off += H
+	_fill_scout_cards_v6(buf, off, game.current_play, N)
+	off += 4 * (N + 1)
+	_fill_play_buffer_v6(buf, off, game.current_play, N)
+	off += PLAY_BUFFER_DIM_V6
+	_fill_metadata_v6(buf, off, game, player, forced_play, H)
+	return torch.from_numpy(buf)
+
+def encode_hand_both_orientations_v6(game, player, hand_offset):
+	"""V6 flip decision: return state tensors for both hand orientations."""
+	state = encode_state_v6(game, player, hand_offset)
+	hand = game.players[player].hand
+	flipped = [(b, a) for a, b in hand]
+	N = game.num_values
+	H = HAND_SLOTS_V6
+	hand_total = H * (N + 2) + H
+	buf_flip = state.numpy().copy()
+	buf_flip[:hand_total] = 0.0
+	_fill_hand_v6(buf_flip, 0, flipped, hand_offset, N, H)
+	_fill_hand_bottom_v6(buf_flip, H * (N + 2), flipped, hand_offset, N, H)
+	return state, torch.from_numpy(buf_flip)
+
+def get_flat_action_mask(game, player, legal_plays, hand_offset):
+	"""Return bool tensor [384] for the flat v6 action space.
+	Play [0..255], Scout [256..319], S&S [320..383]."""
+	H = HAND_SLOTS_V6
+	mask = np.zeros(FLAT_ACTION_SIZE, dtype=np.bool_)
+	p = game.players[player]
+	hand = p.hand
+	hand_len = len(hand)
+
+	# Play region [0..255]: index = start_slot * 16 + end_slot
+	for start, end in legal_plays:
+		s_slot = (hand_offset + start) % H
+		e_slot = (hand_offset + end) % H
+		mask[s_slot * H + e_slot] = True
+
+	if game.phase == Phase.SNS_PLAY:
+		# Forced play: only play region active
+		return torch.from_numpy(mask)
+
+	# Scout and S&S only if there's a play and hand has room
+	has_play = game.current_play is not None
+	if has_play and hand_len < H:
+		play_cards = game.current_play.cards
+		play_len = len(play_cards)
+		# card_choice: 0=left normal, 1=left flipped, 2=right normal, 3=right flipped
+		card_available = [True, True, play_len > 1, play_len > 1]
+
+		# Scout region [256..319]: all insert positions 0..hand_len for each available card
+		for card_choice in range(4):
+			if not card_available[card_choice]:
+				continue
+			base = 256 + card_choice * H
+			for pos in range(hand_len + 1):
+				mask[base + (hand_offset + pos) % H] = True
+
+		# S&S region [320..383]: per-position legality check
+		if p.sns_available:
+			for card_choice in range(4):
+				if not card_available[card_choice]:
+					continue
+				left_end = card_choice < 2
+				flip = card_choice % 2 == 1
+				remaining = list(play_cards)
+				card = remaining.pop(0) if left_end else remaining.pop()
+				if flip:
+					card = (card[1], card[0])
+				reduced_play = Play.from_cards(remaining) if remaining else None
+				base = 320 + card_choice * H
+				for pos in range(hand_len + 1):
+					new_hand = hand[:pos] + [card] + hand[pos:]
+					if _has_any_legal_play(new_hand, reduced_play):
+						mask[base + (hand_offset + pos) % H] = True
+
+	return torch.from_numpy(mask)
+
+def decode_flat_action(action_idx, hand_offset):
+	"""Convert flat action index [0..383] to game action dict.
+	Play: {type, start, end}. Scout/S&S: {type, left_end, flip, insert_pos}."""
+	H = HAND_SLOTS_V6
+	if action_idx < 256:
+		start_slot = action_idx // H
+		end_slot = action_idx % H
+		return {
+			"type": "play",
+			"start": (start_slot - hand_offset) % H,
+			"end": (end_slot - hand_offset) % H,
+		}
+	elif action_idx < 320:
+		idx = action_idx - 256
+		card_choice = idx // H
+		slot = idx % H
+		return {
+			"type": "scout",
+			"left_end": card_choice < 2,
+			"flip": card_choice % 2 == 1,
+			"insert_pos": (slot - hand_offset) % H,
+		}
+	else:
+		idx = action_idx - 320
+		card_choice = idx // H
+		slot = idx % H
+		return {
+			"type": "sns",
+			"left_end": card_choice < 2,
+			"flip": card_choice % 2 == 1,
+			"insert_pos": (slot - hand_offset) % H,
+		}
+
+# --- V6 rotation augmentation permutation tables ---
+
+def _build_permutation_tables():
+	"""Precompute rotation augmentation tables for v6. All shift-by-k for k in 0..15.
+	Returns (PLAY_PERM, SCOUT_PERM, FULL_PERM, HAND_SHIFT) as LongTensors [16, ...]."""
+	H = HAND_SLOTS_V6
+	N = NUM_VALUES_V6
+	slot_size = N + 2  # one-hot + empty + top scalar per hand slot
+	hand_oh_size = H * slot_size  # 192
+	state_size = INPUT_SIZE_V6  # 301
+
+	# Play region [0..255]: index = s*H + e → ((s+k)%H)*H + ((e+k)%H)
+	play_perm = torch.zeros(H, 256, dtype=torch.long)
+	for k in range(H):
+		for idx in range(256):
+			s, e = idx // H, idx % H
+			play_perm[k, idx] = ((s + k) % H) * H + ((e + k) % H)
+
+	# Scout/S&S sub-region [0..63]: card stays, position shifts
+	scout_perm = torch.zeros(H, 64, dtype=torch.long)
+	for k in range(H):
+		for idx in range(64):
+			card, pos = idx // H, idx % H
+			scout_perm[k, idx] = card * H + (pos + k) % H
+
+	# Combined 384-dim permutation
+	full_perm = torch.zeros(H, FLAT_ACTION_SIZE, dtype=torch.long)
+	for k in range(H):
+		full_perm[k, :256] = play_perm[k]
+		full_perm[k, 256:320] = 256 + scout_perm[k]
+		full_perm[k, 320:384] = 320 + scout_perm[k]
+
+	# State tensor hand-shift: gather index so result[i] = source[shift[i]]
+	hand_shift = torch.arange(state_size, dtype=torch.long).unsqueeze(0).expand(H, -1).clone()
+	for k in range(H):
+		for new_s in range(H):
+			old_s = (new_s - k) % H
+			for d in range(slot_size):
+				hand_shift[k, new_s * slot_size + d] = old_s * slot_size + d
+			hand_shift[k, hand_oh_size + new_s] = hand_oh_size + old_s
+
+	return play_perm, scout_perm, full_perm, hand_shift
+
+PLAY_PERM, SCOUT_PERM, FULL_PERM, HAND_SHIFT = _build_permutation_tables()
+
 # Override hot functions with Cython if compiled extension is available
 try:
 	from fast_game import get_legal_plays, _has_any_legal_play, _sns_variant_legal

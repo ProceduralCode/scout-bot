@@ -59,24 +59,25 @@ def flip_hand(hand: list[Card]) -> list[Card]:
 	"""Flip entire hand: swap each card's showing/hidden values."""
 	return [(b, a) for a, b in hand]
 
-def create_deck(num_players: int) -> list[Card]:
-	"""Create the deck for the given player count."""
+def create_deck(num_players: int, num_values: int = 10) -> list[Card]:
+	"""Create the deck for the given player count and number of card values."""
 	cards = []
-	for i in range(1, 11):
-		for j in range(i + 1, 11):
+	for i in range(1, num_values + 1):
+		for j in range(i + 1, num_values + 1):
 			cards.append((i, j))
 	if num_players == 3:
-		# Remove all cards with 10 on either side (9 cards -> 36 remain)
-		cards = [(a, b) for a, b in cards if a != 10 and b != 10]
+		# Remove all cards with max value on either side
+		cards = [(a, b) for a, b in cards if a != num_values and b != num_values]
 	elif num_players == 4:
-		# Remove only the 9/10 card (1 card -> 44 remain)
-		cards = [(a, b) for a, b in cards if not (a == 9 and b == 10)]
+		# Remove only the highest pair card
+		cards = [(a, b) for a, b in cards if not (a == num_values - 1 and b == num_values)]
 	return cards
 
 class Game:
-	def __init__(self, num_players: int):
+	def __init__(self, num_players: int, num_values: int = 10):
 		assert 3 <= num_players <= 5
 		self.num_players = num_players
+		self.num_values = num_values
 		self.total_rounds = num_players
 		self.round_number = 0
 		self.cumulative_scores = [0] * num_players
@@ -93,7 +94,7 @@ class Game:
 
 	def start_round(self):
 		"""Deal cards and enter flip decision phase."""
-		deck = create_deck(self.num_players)
+		deck = create_deck(self.num_players, self.num_values)
 		random.shuffle(deck)
 		# Randomize each card's initial orientation
 		for i in range(len(deck)):
@@ -274,4 +275,5 @@ class Game:
 			"round_number": self.round_number,
 			"total_rounds": self.total_rounds,
 			"turn_number": self.turn_number,
+			"num_values": self.num_values,
 		}

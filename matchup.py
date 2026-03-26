@@ -2,10 +2,10 @@ import random
 import os
 import torch
 from encoding import (
-	INPUT_SIZE, INPUT_SIZE_V2,
+	INPUT_SIZE, INPUT_SIZE_V2, INPUT_SIZE_V6,
 	PLAY_START_SIZE_V2, PLAY_END_SIZE_V2, SCOUT_INSERT_SIZE_V2,
 )
-from network import ScoutNetwork, RandomBot
+from network import ScoutNetwork, FlatScoutNetwork, RandomBot
 from training import play_eval_game
 
 class Agent:
@@ -29,7 +29,9 @@ def load_agent(spec: str) -> Agent:
 			ls = cfg["layer_sizes"]
 		else:
 			ls = [cfg.get("first_hidden_size", 256), cfg.get("hidden_size", 128)]
-		if ev == 2:
+		if ev == 6:
+			network = FlatScoutNetwork(INPUT_SIZE_V6, ls, encoding_version=6)
+		elif ev == 2:
 			network = ScoutNetwork(INPUT_SIZE_V2, ls,
 				play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
 				scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
