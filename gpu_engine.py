@@ -790,6 +790,17 @@ def apply_actions(
 	state.current_player = torch.where(advance, new_cp, state.current_player)
 
 
+# ── State utilities ──────────────────────────────────────────────────────────
+
+def repeat_state(state: GpuGameState, n: int) -> GpuGameState:
+	"""Repeat each game n times along the batch dim (for rollout expansion)."""
+	from dataclasses import fields
+	return GpuGameState(**{
+		f.name: getattr(state, f.name).repeat_interleave(n, dim=0)
+		for f in fields(state)
+	})
+
+
 # ── Scoring ──────────────────────────────────────────────────────────────────
 
 def compute_scores(state: GpuGameState) -> list[list[int]]:
@@ -806,6 +817,15 @@ def compute_scores(state: GpuGameState) -> list[list[int]]:
 		n = n_p[b].item()
 		result.append(scores[b, :n].tolist())
 	return result
+
+
+def compute_scores_tensor(state: GpuGameState) -> Tensor:
+	"""Per-player round scores as [B, MAX_P] long tensor (stays on device).
+	Slots beyond num_players are 0."""
+	p_idx = torch.arange(MAX_P, device=state.done.device)
+	is_ender = (p_idx.unsqueeze(0) == state.round_ender.long().unsqueeze(1))
+	return (state.collected.long() + state.scout_tokens.long()
+		- state.hand_len.long() * (~is_ender).long())
 
 
 # ── GPU rollout ──────────────────────────────────────────────────────────────

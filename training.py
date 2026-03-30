@@ -450,8 +450,9 @@ def _play_round(game: Game, networks: list[ScoutNetwork],
 				ho = random.randint(0, HAND_SLOTS - 1)
 				po = random.randint(0, PLAY_SLOTS - 1)
 				t_normal, t_flipped = encode_hand_both_orientations(game, p, ho, po)
-			h_normal = net(t_normal)
-			h_flipped = net(t_flipped)
+			_dev = next(net.parameters()).device
+			h_normal = net(t_normal.to(_dev))
+			h_flipped = net(t_flipped.to(_dev))
 			v_normal = net.value(h_normal).item()
 			v_flipped = net.value(h_flipped).item()
 		did_flip = v_flipped > v_normal
@@ -969,6 +970,7 @@ class OpponentPool:
 		self.versions: list[ScoutNetwork] = []
 	def add(self, network: ScoutNetwork):
 		snapshot = copy.deepcopy(network)
+		snapshot.cpu()
 		snapshot.eval()
 		self.versions.append(snapshot)
 		if len(self.versions) > self.max_size:
@@ -1524,15 +1526,16 @@ def _play_turn_v6(game: Game, networks: list, game_log=None) -> list[StepRecordV
 	hand_offset = random.randint(0, H - 1)
 	round_num = game.round_number
 	records = []
+	dev = next(net.parameters()).device
 	with torch.no_grad():
 		hand = game.players[p].hand
 		legal_plays = get_legal_plays(hand, game.current_play)
 		forced_play = game.phase == Phase.SNS_PLAY
 		state = encode_state_v6(game, p, hand_offset, forced_play=forced_play)
-		hidden = net(state)
+		hidden = net(state.to(dev))
 		value = net.value(hidden).item()
 		logits = net.policy_logits(hidden)
-		mask_t = get_flat_action_mask(game, p, legal_plays, hand_offset)
+		mask_t = get_flat_action_mask(game, p, legal_plays, hand_offset).to(dev)
 		if not mask_t.any():
 			game._advance_turn()
 			return records
@@ -1540,7 +1543,7 @@ def _play_turn_v6(game: Game, networks: list, game_log=None) -> list[StepRecordV
 		old_lp = masked_log_prob(logits, mask_t, action_idx).item()
 		action = decode_flat_action(action_idx, hand_offset)
 		rec = StepRecordV6(
-			state=state, action=action_idx, mask=mask_t.numpy(),
+			state=state, action=action_idx, mask=mask_t.cpu().numpy(),
 			old_log_prob=old_lp, value=value, reward=0.0,
 			player=p, round_num=round_num, game_id=0,
 			hand_offset=hand_offset, play_length=None, scout_quality=None,
@@ -1598,6 +1601,7 @@ def rollout_from_states_batched_v6(snapshots: list[Game], network) -> list[list[
 	if not snapshots:
 		return []
 	H = HAND_SLOTS_V6
+	dev = next(network.parameters()).device
 	games = [s.clone() for s in snapshots]
 	with torch.no_grad():
 		while True:
@@ -1619,8 +1623,8 @@ def rollout_from_states_batched_v6(snapshots: list[Game], network) -> list[list[
 				masks.append(mask)
 			if not pending:
 				break
-			state_batch = torch.stack(states)
-			mask_batch = torch.stack(masks)
+			state_batch = torch.stack(states).to(dev)
+			mask_batch = torch.stack(masks).to(dev)
 			hidden = network(state_batch)
 			logits = network.policy_logits(hidden)
 			has_action = mask_batch.any(dim=1)
@@ -1650,103 +1654,184 @@ def play_games_v6(network, num_games: int, num_players: int,
 				  shaped_bonus_scale: float = 0.0,
 				  temperature: float = 1.0) -> list[StepRecordV6]:
 	"""Play single-round games with v6 flat actions for GAE-based training (no rollouts).
-	Each game plays 1 round with a random starting player, assigns rewards, returns StepRecordV6 records.
+	Batches network inference across all active games for GPU efficiency.
 	Temperature > 1.0 flattens the sampling distribution for more exploration."""
 	H = HAND_SLOTS_V6
 	all_records: list[StepRecordV6] = []
 	network.eval()
+	dev = next(network.parameters()).device
 	with torch.no_grad():
-		for game_idx in range(num_games):
-			game = Game(num_players)
-			game.starting_player = random.randint(0, num_players - 1)
-			game.total_rounds = 1
-			networks = []
+		games = [Game(num_players) for _ in range(num_games)]
+		game_networks = []
+		for g_idx in range(num_games):
+			games[g_idx].starting_player = random.randint(0, num_players - 1)
+			games[g_idx].total_rounds = 1
+			nets = []
 			for seat in range(num_players):
 				if seat < training_seats:
-					networks.append(network)
+					nets.append(network)
 				elif opponent_pool:
-					networks.append(random.choice(opponent_pool))
+					nets.append(random.choice(opponent_pool))
 				else:
-					networks.append(network)
-			for round_idx in range(game.total_rounds):
-				game.start_round()
-				# Flip decisions
-				for p in range(num_players):
-					net = networks[p]
+					nets.append(network)
+			game_networks.append(nets)
+		game_records = [[] for _ in range(num_games)]
+		for g in games:
+			g.start_round()
+		# === Flip phase (batched) ===
+		flip_info = []  # (g_idx, p) for training network
+		flip_normals = []
+		flip_flipped = []
+		for g_idx, g in enumerate(games):
+			for p in range(num_players):
+				if game_networks[g_idx][p] is network:
 					ho = random.randint(0, H - 1)
-					t_normal, t_flipped = encode_hand_both_orientations_v6(game, p, ho)
-					h_normal = net(t_normal)
-					h_flipped = net(t_flipped)
-					v_normal = net.value(h_normal).item()
-					v_flipped = net.value(h_flipped).item()
-					game.submit_flip_decision(p, do_flip=v_flipped > v_normal)
-				# Play turns
-				round_records: list[StepRecordV6] = []
-				while game.phase in (Phase.TURN, Phase.SNS_PLAY):
-					p = game.current_player
-					net = networks[p]
-					hand = game.players[p].hand
-					legal_plays = get_legal_plays(hand, game.current_play)
-					hand_offset = random.randint(0, H - 1)
-					forced_play = game.phase == Phase.SNS_PLAY
-					state = encode_state_v6(game, p, hand_offset, forced_play=forced_play)
-					hidden = net(state)
-					value = net.value(hidden).item()
-					logits = net.policy_logits(hidden)
-					# Temperature scaling for training seats (flattens distribution for exploration)
-					sample_logits = logits / temperature if temperature != 1.0 and p < training_seats else logits
-					mask_t = get_flat_action_mask(game, p, legal_plays, hand_offset)
-					if not mask_t.any():
-						game._advance_turn()
+					t_n, t_f = encode_hand_both_orientations_v6(g, p, ho)
+					flip_info.append((g_idx, p))
+					flip_normals.append(t_n)
+					flip_flipped.append(t_f)
+		if flip_normals:
+			normals_batch = torch.stack(flip_normals).to(dev)
+			flipped_batch = torch.stack(flip_flipped).to(dev)
+			h_n = network(normals_batch)
+			h_f = network(flipped_batch)
+			v_n = network.value(h_n).squeeze(-1)
+			v_f = network.value(h_f).squeeze(-1)
+			for i, (g_idx, p) in enumerate(flip_info):
+				games[g_idx].submit_flip_decision(p, do_flip=v_f[i].item() > v_n[i].item())
+		# Opponent flips (unbatched, different networks)
+		for g_idx, g in enumerate(games):
+			for p in range(num_players):
+				net = game_networks[g_idx][p]
+				if net is not network:
+					ho = random.randint(0, H - 1)
+					t_n, t_f = encode_hand_both_orientations_v6(g, p, ho)
+					h_n = net(t_n)
+					h_f = net(t_f)
+					g.submit_flip_decision(p, do_flip=net.value(h_f).item() > net.value(h_n).item())
+		# === Turn phase (batched) ===
+		while any(g.phase in (Phase.TURN, Phase.SNS_PLAY) for g in games):
+			train_pending = []  # (g_idx, p, ho, state, mask_t, hand)
+			opp_pending = []    # ((g_idx, p, ho, state, mask_t, hand), net)
+			for g_idx, g in enumerate(games):
+				if g.phase not in (Phase.TURN, Phase.SNS_PLAY):
+					continue
+				p = g.current_player
+				net = game_networks[g_idx][p]
+				hand = g.players[p].hand
+				legal_plays = get_legal_plays(hand, g.current_play)
+				ho = random.randint(0, H - 1)
+				forced_play = g.phase == Phase.SNS_PLAY
+				state = encode_state_v6(g, p, ho, forced_play=forced_play)
+				mask_t = get_flat_action_mask(g, p, legal_plays, ho)
+				entry = (g_idx, p, ho, state, mask_t, hand)
+				if net is network:
+					train_pending.append(entry)
+				else:
+					opp_pending.append((entry, net))
+			if not train_pending and not opp_pending:
+				break
+			# Batched forward pass for training network
+			if train_pending:
+				states_batch = torch.stack([e[3] for e in train_pending]).to(dev)
+				masks_batch = torch.stack([e[4] for e in train_pending]).to(dev)
+				hidden = network(states_batch)
+				values = network.value(hidden).squeeze(-1)
+				logits = network.policy_logits(hidden)
+				if temperature != 1.0:
+					is_train_seat = torch.tensor(
+						[e[1] < training_seats for e in train_pending],
+						dtype=torch.bool, device=dev)
+					sample_logits = torch.where(is_train_seat.unsqueeze(1),
+										 logits / temperature, logits)
+				else:
+					sample_logits = logits
+				has_action = masks_batch.any(dim=1)
+				actions_batch = batched_masked_sample(sample_logits, masks_batch)
+				# Record old_log_prob at T=1 (the policy being optimized),
+				# not at T=temperature (the exploration policy)
+				old_lps = _batched_masked_log_prob(logits, masks_batch, actions_batch)
+				# Move results to CPU in bulk to avoid per-element GPU syncs
+				has_action_cpu = has_action.tolist()
+				actions_cpu = actions_batch.tolist()
+				old_lps_cpu = old_lps.tolist()
+				values_cpu = values.tolist()
+				for i, (g_idx, p, ho, state, mask_t, hand) in enumerate(train_pending):
+					g = games[g_idx]
+					if not has_action_cpu[i]:
+						g._advance_turn()
 						continue
-					action_idx, _ = masked_sample(sample_logits, mask_t)
-					old_lp = masked_log_prob(sample_logits, mask_t, action_idx).item()
-					action = decode_flat_action(action_idx, hand_offset)
-					rec = StepRecordV6(
-						state=state, action=action_idx, mask=mask_t.numpy(),
-						old_log_prob=old_lp, value=value, reward=0.0,
-						player=p, round_num=round_idx, game_id=game_idx,
-						hand_offset=hand_offset, play_length=None, scout_quality=None,
-						predicted_value=value,
-					)
+					action_idx = actions_cpu[i]
+					action = decode_flat_action(action_idx, ho)
+					if p < training_seats:
+						rec = StepRecordV6(
+							state=state, action=action_idx, mask=mask_t.numpy(),
+							old_log_prob=old_lps_cpu[i],
+							value=values_cpu[i], reward=0.0,
+							player=p, round_num=0, game_id=g_idx,
+							hand_offset=ho, play_length=None, scout_quality=None,
+							predicted_value=values_cpu[i],
+						)
+					else:
+						rec = None
 					if action['type'] == 'play':
-						rec.play_length = action['end'] - action['start'] + 1
-						round_records.append(rec)
-						game.apply_play(action['start'], action['end'])
+						if rec:
+							rec.play_length = action['end'] - action['start'] + 1
+							game_records[g_idx].append(rec)
+						g.apply_play(action['start'], action['end'])
 					elif action['type'] == 'scout':
-						left_end, flip = action['left_end'], action['flip']
-						insert_pos = action['insert_pos']
-						play_cards = game.current_play.cards
-						scouted = play_cards[0] if left_end else play_cards[-1]
-						if flip:
-							scouted = (scouted[1], scouted[0])
-						new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
-						max_len = 1
-						for s, e in get_legal_plays(new_hand, None):
-							if s <= insert_pos <= e:
-								max_len = max(max_len, e - s + 1)
-						rec.scout_quality = max_len
-						round_records.append(rec)
-						game.apply_scout(left_end, flip, insert_pos)
+						if rec:
+							left_end, flip = action['left_end'], action['flip']
+							insert_pos = action['insert_pos']
+							play_cards = g.current_play.cards
+							scouted = play_cards[0] if left_end else play_cards[-1]
+							if flip:
+								scouted = (scouted[1], scouted[0])
+							new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
+							max_len = 1
+							for s, e in get_legal_plays(new_hand, None):
+								if s <= insert_pos <= e:
+									max_len = max(max_len, e - s + 1)
+							rec.scout_quality = max_len
+							game_records[g_idx].append(rec)
+						g.apply_scout(action['left_end'], action['flip'], action['insert_pos'])
 					elif action['type'] == 'sns':
-						left_end, flip = action['left_end'], action['flip']
-						insert_pos = action['insert_pos']
-						play_cards = game.current_play.cards
-						scouted = play_cards[0] if left_end else play_cards[-1]
-						if flip:
-							scouted = (scouted[1], scouted[0])
-						new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
-						max_len = 1
-						for s, e in get_legal_plays(new_hand, None):
-							if s <= insert_pos <= e:
-								max_len = max(max_len, e - s + 1)
-						rec.scout_quality = max_len
-						round_records.append(rec)
-						game.apply_sns_scout(left_end, flip, insert_pos)
-				# Assign rewards — _assign_round_rewards works with StepRecordV6 via duck typing
-				_assign_round_rewards(round_records, game, round_idx,
-									  reward_mode, reward_distribution, shaped_bonus_scale)
-				all_records.extend(r for r in round_records if r.player < training_seats)
+						if rec:
+							left_end, flip = action['left_end'], action['flip']
+							insert_pos = action['insert_pos']
+							play_cards = g.current_play.cards
+							scouted = play_cards[0] if left_end else play_cards[-1]
+							if flip:
+								scouted = (scouted[1], scouted[0])
+							new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
+							max_len = 1
+							for s, e in get_legal_plays(new_hand, None):
+								if s <= insert_pos <= e:
+									max_len = max(max_len, e - s + 1)
+							rec.scout_quality = max_len
+							game_records[g_idx].append(rec)
+						g.apply_sns_scout(action['left_end'], action['flip'], action['insert_pos'])
+			# Opponent forward passes (unbatched)
+			for (g_idx, p, ho, state, mask_t, hand), net in opp_pending:
+				g = games[g_idx]
+				if not mask_t.any():
+					g._advance_turn()
+					continue
+				hidden = net(state)
+				logits = net.policy_logits(hidden)
+				action_idx, _ = masked_sample(logits, mask_t)
+				action = decode_flat_action(action_idx, ho)
+				if action['type'] == 'play':
+					g.apply_play(action['start'], action['end'])
+				elif action['type'] == 'scout':
+					g.apply_scout(action['left_end'], action['flip'], action['insert_pos'])
+				elif action['type'] == 'sns':
+					g.apply_sns_scout(action['left_end'], action['flip'], action['insert_pos'])
+		# Assign rewards per game
+		for g_idx, g in enumerate(games):
+			_assign_round_rewards(game_records[g_idx], g, 0,
+								  reward_mode, reward_distribution, shaped_bonus_scale)
+			all_records.extend(game_records[g_idx])
 	return all_records
 
 def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
@@ -1762,7 +1847,10 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 	all_advantages: list[float] = []
 	all_margin_stds: list[float] = []
 	network.eval()
+	dev = next(network.parameters()).device
 	with torch.no_grad():
+		all_snapshots = []
+		per_game_data = []
 		for game_idx in range(num_games):
 			game = Game(num_players)
 			networks = [network] * num_players
@@ -1771,8 +1859,8 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 			for p in range(num_players):
 				ho = random.randint(0, H - 1)
 				t_normal, t_flipped = encode_hand_both_orientations_v6(game, p, ho)
-				h_normal = network(t_normal)
-				h_flipped = network(t_flipped)
+				h_normal = network(t_normal.to(dev))
+				h_flipped = network(t_flipped.to(dev))
 				v_normal = network.value(h_normal).item()
 				v_flipped = network.value(h_flipped).item()
 				game.submit_flip_decision(p, do_flip=v_flipped > v_normal)
@@ -1788,7 +1876,7 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 				hand_offset = random.randint(0, H - 1)
 				forced_play = game.phase == Phase.SNS_PLAY
 				state = encode_state_v6(game, p, hand_offset, forced_play=forced_play)
-				hidden = network(state)
+				hidden = network(state.to(dev))
 				value = network.value(hidden).item()
 				logits = network.policy_logits(hidden)
 				sample_logits = logits / temperature if temperature != 1.0 else logits
@@ -1804,8 +1892,10 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 				else:
 					before_snap = len(snapshots)
 					snapshots.append(game.clone())
-				action_idx, _ = masked_sample(sample_logits, mask_t)
-				old_lp = masked_log_prob(sample_logits, mask_t, action_idx).item()
+				mask_dev = mask_t.to(dev)
+				action_idx, _ = masked_sample(sample_logits, mask_dev)
+				# Record old_log_prob at T=1 (matches augmentation and PPO update)
+				old_lp = masked_log_prob(logits, mask_dev, action_idx).item()
 				action = decode_flat_action(action_idx, hand_offset)
 				rec = StepRecordV6(
 					state=state, action=action_idx, mask=mask_t.numpy(),
@@ -1860,54 +1950,55 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 					record_snap_pairs.append((before_snap, after_insert_snap))
 					# Forced play uses this snapshot as its "before"
 					reuse_before_snap = after_insert_snap
-			# Run rollouts from all snapshots
-			expanded = [snap for snap in snapshots for _ in range(rollouts_per_state)]
-			if gpu_rollout and torch.cuda.is_available():
-				from gpu_engine import from_snapshots as gpu_from_snapshots
-				from numba_engine import rollout_numba
-				network.cuda()
-				try:
-					gpu_state = gpu_from_snapshots(expanded, device='cuda')
-					all_scores = rollout_numba(gpu_state, network)
-				finally:
-					network.cpu()
-			else:
-				all_scores = rollout_from_states_batched_v6(expanded, network)
-			# Aggregate to per-snapshot, per-player margins (track variance for noise estimation)
-			num_snapshots = len(snapshots)
-			snapshot_values = []
-			game_margin_stds = []
-			for snap_idx in range(num_snapshots):
-				player_sums = [0.0] * num_players
-				player_sq_sums = [0.0] * num_players
-				base = snap_idx * rollouts_per_state
-				for r in range(rollouts_per_state):
-					scores = all_scores[base + r]
-					for pi in range(num_players):
-						opp = [scores[j] for j in range(num_players) if j != pi]
-						margin = (scores[pi] - sum(opp) / len(opp)) / 10.0
-						player_sums[pi] += margin
-						player_sq_sums[pi] += margin * margin
-				means = [s / rollouts_per_state for s in player_sums]
-				stds = [max(0, sq / rollouts_per_state - means[pi]**2)**0.5
-						for pi, sq in enumerate(player_sq_sums)]
-				snapshot_values.append(means)
-				game_margin_stds.append(sum(stds) / num_players)
-			# Compute advantages and value targets
+			# Accumulate snapshots for batched rollout
+			snap_offset = len(all_snapshots)
+			all_snapshots.extend(snapshots)
+			per_game_data.append((game_idx, records, record_snap_pairs, snap_offset, len(snapshots)))
+		# Batched rollout: pack unique snapshots, repeat on GPU, run once
+		n_snaps = len(all_snapshots)
+		if gpu_rollout and torch.cuda.is_available():
+			from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state, compute_scores_tensor
+			from numba_engine import rollout_numba
+			gpu_state = gpu_from_snapshots(all_snapshots, device='cuda')
+			gpu_state = repeat_state(gpu_state, rollouts_per_state)
+			scores_t = rollout_numba(gpu_state, network)
+		else:
+			expanded = [snap for snap in all_snapshots for _ in range(rollouts_per_state)]
+			scores_list = rollout_from_states_batched_v6(expanded, network)
+			# Pad to MAX_P columns for uniform tensor shape
+			from gpu_engine import MAX_P
+			scores_t = torch.zeros(len(scores_list), MAX_P, dtype=torch.long)
+			for i, sc in enumerate(scores_list):
+				for j, v in enumerate(sc):
+					scores_t[i, j] = v
+		# Vectorized margin computation: margin_p = (score_p * n - total) / ((n-1) * 10)
+		sf = scores_t[:, :num_players].float()
+		total = sf.sum(dim=1, keepdim=True)
+		margins = (sf * num_players - total) / ((num_players - 1) * 10.0)  # [B_expanded, n_p]
+		# Reshape to [n_snaps, rollouts_per_state, n_p], compute per-snapshot mean/std
+		margins = margins.view(n_snaps, rollouts_per_state, num_players)
+		snap_means = margins.mean(dim=1)  # [n_snaps, n_p]
+		snap_stds = margins.std(dim=1, correction=0)  # [n_snaps, n_p] population std
+		avg_std_per_snap = snap_stds.mean(dim=1)  # [n_snaps] mean across players
+		snap_means = snap_means.cpu()
+		avg_std_per_snap = avg_std_per_snap.cpu()
+		# Per-game advantage computation
+		for game_idx, records, record_snap_pairs, snap_offset, num_snaps in per_game_data:
+			game_means = snap_means[snap_offset:snap_offset + num_snaps]
 			game_advantages = []
 			for rec_idx, (before_snap, after_snap) in enumerate(record_snap_pairs):
 				pi = records[rec_idx].player
-				v_before = snapshot_values[before_snap][pi]
-				v_after = snapshot_values[after_snap][pi]
+				v_before = game_means[before_snap, pi].item()
+				v_after = game_means[after_snap, pi].item()
 				game_advantages.append(v_after - v_before)
 			for rec_idx, (before_snap, _) in enumerate(record_snap_pairs):
-				records[rec_idx].value = snapshot_values[before_snap][records[rec_idx].player]
+				records[rec_idx].value = game_means[before_snap, records[rec_idx].player].item()
 			for rec in records:
 				rec.game_id = game_idx
 			filtered = [i for i, r in enumerate(records) if r.player < training_seats]
 			all_records.extend(records[i] for i in filtered)
 			all_advantages.extend(game_advantages[i] for i in filtered)
-			all_margin_stds.extend(game_margin_stds)
+			all_margin_stds.extend(avg_std_per_snap[snap_offset:snap_offset + num_snaps].tolist())
 	# Normalize advantages
 	avg_margin_std = sum(all_margin_stds) / len(all_margin_stds) if all_margin_stds else 0.0
 	return all_records, all_advantages, avg_margin_std
@@ -1970,6 +2061,13 @@ def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv,
 				 entropy_floors=None, entropy_floor_coeff=1.0,
 				 zero_scout_policy_grad=False):
 	"""Single PPO gradient step on one mini-batch. Returns metrics dict."""
+	dev = next(network.parameters()).device
+	states = states.to(dev)
+	masks = masks.to(dev)
+	actions = actions.to(dev)
+	old_log_probs = old_log_probs.to(dev)
+	adv = adv.to(dev)
+	v_target = v_target.to(dev)
 	hidden = network(states)
 	v_pred = network.value(hidden).squeeze(-1)
 	value_loss = F.mse_loss(v_pred, v_target)
@@ -2000,7 +2098,7 @@ def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv,
 		scout_ent = _batched_masked_entropy(logits[has_scout], full_scout[has_scout])
 	# Entropy floor penalty: quadratic when region entropy drops below floor,
 	# only for samples with 2+ legal options in that region
-	floor_penalty = torch.tensor(0.0)
+	floor_penalty = torch.tensor(0.0, device=dev)
 	if entropy_floors:
 		for key, ent_t, region_mask, has_region in [
 			("play", play_ent, play_mask, has_play),
@@ -2127,12 +2225,13 @@ def augment_rotation_v6(steps: list[StepRecordV6], advantages: list[float],
 	all_steps = list(steps)
 	all_advs = list(advantages)
 
-	# Stack originals for vectorized permutation
+	# Stack originals for vectorized permutation (CPU — permutation tables are CPU)
 	orig_states = torch.stack([s.state for s in steps])             # [n, 301]
 	orig_actions = torch.tensor([s.action for s in steps], dtype=torch.long)  # [n]
 	orig_masks = torch.from_numpy(np.stack([s.mask for s in steps]))  # [n, 384]
 
 	network.eval()
+	dev = next(network.parameters()).device
 	with torch.no_grad():
 		for k in range(1, H):
 			shift = HAND_SHIFT[k]           # [301] gather index
@@ -2144,19 +2243,21 @@ def augment_rotation_v6(steps: list[StepRecordV6], advantages: list[float],
 			aug_masks = orig_masks[:, inv_perm]       # [n, 384]
 
 			# Forward pass to compute correct old_log_probs at shifted states
-			hidden = network(aug_states)
+			hidden = network(aug_states.to(dev))
 			logits = network.policy_logits(hidden)
-			masked_logits = logits.masked_fill(~aug_masks, float('-inf'))
+			masked_logits = logits.masked_fill(~aug_masks.to(dev), float('-inf'))
 			log_probs = torch.log_softmax(masked_logits, dim=-1)
-			old_lps = log_probs.gather(1, aug_actions.unsqueeze(1)).squeeze(1)
+			old_lps = log_probs.gather(1, aug_actions.to(dev).unsqueeze(1)).squeeze(1)
 
 			aug_masks_np = aug_masks.numpy()
+			old_lps_list = old_lps.tolist()
+			aug_actions_list = aug_actions.tolist()
 			for i, (step, adv) in enumerate(zip(steps, advantages)):
 				all_steps.append(StepRecordV6(
 					state=aug_states[i],
-					action=aug_actions[i].item(),
+					action=aug_actions_list[i],
 					mask=aug_masks_np[i].copy(),
-					old_log_prob=old_lps[i].item(),
+					old_log_prob=old_lps_list[i],
 					value=step.value,
 					reward=step.reward,
 					player=step.player,

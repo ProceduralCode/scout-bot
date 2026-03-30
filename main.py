@@ -101,12 +101,14 @@ PARAMS = {
 	# "rollout_fraction": 0.1,  # fraction of games_per_iteration to use rollouts instead of GAE
 	# "rollout_fraction": 0.05,
 	"rollout_fraction": 0.25,
-	"sampling_temperature": 1.5,  # >1.0 flattens sampling for exploration; recorded in old_log_prob so PPO ratios are correct
+	# "sampling_temperature": 1.5,  # >1.0 flattens sampling for exploration; recorded in old_log_prob so PPO ratios are correct
+	"sampling_temperature": 2.5,
 	"augment_rotations": 16,  # 1 = no augmentation, 16 = all rotations
 	"use_direct_pg": False,  # vanilla policy gradient instead of PPO (forces 1 epoch)
 	"diagnose": False,  # per-iteration diagnostics: raw advantages by action type, policy prefs, value accuracy
 	"attention": {"dim": 32, "heads": 2, "layers": 1},
-	"save_dir": "bots/v7_4",
+	# "save_dir": "bots/v7_5",
+	"save_dir": "bots/v7_7",
 	"eval_opponents": {
 		# "random": "random", # magic word → uses RandomBot
 		"v1_4": "bots/v1_4/latest.pt",
@@ -169,7 +171,8 @@ def _count_dormant_neurons(network, states, threshold=0.01):
 			batch = states[:2000]
 		else:
 			batch = torch.stack(states[:2000])
-		network(batch)
+		dev = next(network.parameters()).device
+		network(batch.to(dev))
 	# Count dormant neurons (mean |activation| below threshold)
 	result = {"total": 0, "total_neurons": 0}
 	for idx in sorted(act_outputs):
@@ -187,6 +190,11 @@ def _count_dormant_neurons(network, states, threshold=0.01):
 
 def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir):
 	"""Run eval vs all opponents, update metrics, save charts."""
+	# Eval runs infrequently — move to CPU to avoid batch-1 GPU overhead
+	# and device mismatches in probe code that expects CPU tensors
+	was_cuda = next(network.parameters()).is_cuda
+	if was_cuda:
+		network.cpu()
 	try:
 		network.eval()
 		n_eval = 40
@@ -214,6 +222,9 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 			for k in expected_keys:
 				if k in metrics_history and len(metrics_history[k]) > len(metrics_history["eval_iteration"]):
 					metrics_history[k].pop()
+	finally:
+		if was_cuda:
+			network.cuda()
 	_save_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	if cfg.get("diagnose"):
 		_save_diagnostic_charts(metrics_history, save_dir)
@@ -273,7 +284,8 @@ def _save_diagnostic_charts(metrics_history: dict, save_dir: str):
 				ax.plot(iters[-len(trimmed[key]):], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
 				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2,
 						label=label, linestyle=ls)
-		ax.legend(fontsize=7, loc="upper right")
+		if ax.get_legend_handles_labels()[1]:
+			ax.legend(fontsize=7, loc="upper right")
 		_style(ax, "Signal vs Noise",
 			"Advantage std = total spread. Rollout noise = expected noise from finite rollouts. "
 			"Gap between them = real signal. If they overlap, advantages are pure noise.")
@@ -288,7 +300,8 @@ def _save_diagnostic_charts(metrics_history: dict, save_dir: str):
 				ax.plot(iters[-len(trimmed[key]):], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
 				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2, label=label)
 		ax.set_ylim(0, 1)
-		ax.legend(fontsize=7, loc="upper right")
+		if ax.get_legend_handles_labels()[1]:
+			ax.legend(fontsize=7, loc="upper right")
 		_style(ax, "Policy Preference (when pairs legal)",
 			"Avg probability mass on singles vs pairs vs 3+ plays, only at states where pair+ actions are legal.")
 		# [1,0] Advantage distribution — p10/p90 band + abs_mean
@@ -306,7 +319,8 @@ def _save_diagnostic_charts(metrics_history: dict, save_dir: str):
 			ax.plot(iters[-len(smoothed["diag_adv_abs_mean"]):], smoothed["diag_adv_abs_mean"],
 					color="#ffa552", linewidth=2, label="Mean |advantage|")
 		ax.axhline(y=0, color="#666666", linestyle="--", alpha=0.5)
-		ax.legend(fontsize=7, loc="upper right")
+		if ax.get_legend_handles_labels()[1]:
+			ax.legend(fontsize=7, loc="upper right")
 		_style(ax, "Advantage Distribution",
 			"Shaded band = 10th-90th percentile of raw advantages. "
 			"Orange = mean absolute advantage. Shows what signal the policy sees.")
@@ -401,7 +415,8 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 							color=color, linewidth=1.5, label=label)
 			if ylim:
 				ax.set_ylim(*ylim)
-			ax.legend(fontsize=7, loc="upper right")
+			if ax.get_legend_handles_labels()[1]:
+				ax.legend(fontsize=7, loc="upper right")
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
 					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
@@ -590,7 +605,8 @@ def _compute_diagnostics(network, records, raw_advantages,
 	else:
 		diag["snr"] = 0.0
 	# 3. Policy preference: P(single) vs P(pair) vs P(3+) when pairs are legal
-	states = torch.stack([r.state for r in records])
+	dev = next(network.parameters()).device
+	states = torch.stack([r.state for r in records]).to(dev)
 	with torch.no_grad():
 		hidden = network(states)
 		all_logits = network.policy_logits(hidden)
@@ -708,7 +724,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 	# Auto-resume if save dir has a checkpoint
 	resume_path = os.path.join(save_dir, "latest.pt")
 	if os.path.exists(resume_path):
-		checkpoint = torch.load(resume_path, weights_only=False)
+		checkpoint = torch.load(resume_path, weights_only=False, map_location='cpu')
 		network.load_state_dict(checkpoint["model_state"])
 		optimizer.load_state_dict(checkpoint["optimizer_state"])
 		start_iter = checkpoint["iteration"] + 1
@@ -738,7 +754,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		print(f"Resumed from iteration {start_iter - 1}")
 	pool = OpponentPool(max_size=cfg["opponent_pool_size"])
 	if os.path.exists(resume_path):
-		checkpoint = torch.load(resume_path, weights_only=False)
+		checkpoint = torch.load(resume_path, weights_only=False, map_location='cpu')
 		if "opponent_pool" in checkpoint:
 			pool.load_state_dicts(checkpoint["opponent_pool"], network)
 			print(f"  Restored opponent pool ({len(pool.versions)} versions)")
@@ -750,7 +766,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		if path == "random":
 			eval_opponents[name] = RandomBot()
 		else:
-			ckpt = torch.load(os.path.join(SCRIPT_DIR, path), weights_only=False)
+			ckpt = torch.load(os.path.join(SCRIPT_DIR, path), weights_only=False, map_location='cpu')
 			ckpt_cfg = ckpt.get("config", {})
 			if "layer_sizes" in ckpt_cfg:
 				ls = ckpt_cfg["layer_sizes"]
@@ -792,6 +808,12 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 	replay_past = cfg.get("replay_past", [])
 	replay_buffer = deque(maxlen=len(replay_past) + 1) if replay_past else None
 	last_snapshot_time = time.time()
+	if torch.cuda.is_available():
+		network.cuda()
+		for state in optimizer.state.values():
+			for k, v in state.items():
+				if isinstance(v, torch.Tensor):
+					state[k] = v.cuda()
 	# Pre-training eval (init weights baseline)
 	if start_iter <= 1:
 		_run_eval(network, eval_opponents, metrics_history, 0, cfg, save_dir)
@@ -941,6 +963,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 						zero_scout_policy_grad=cfg.get("zero_scout_policy_grad", False),
 					kl_target=cfg.get("kl_target", 0.015),
 					)
+					# Epoch 0: ratios must be ~1.0 (catches old_log_prob recording bugs)
+					if epoch == 0 and (not replay_buffer or len(replay_buffer) <= 1) and abs(m["mean_ratio"] - 1.0) > 0.01:
+						print(f"  WARNING: epoch 0 mean ratio={m['mean_ratio']:.4f} (expected ~1.0)")
 				elif use_dpg:
 					m = direct_pg_update(
 						network, optimizer, training_batch,

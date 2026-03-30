@@ -7,12 +7,16 @@ numba.cuda.as_cuda_array() on PyTorch CUDA tensors.
 Reference implementation: gpu_engine.py (used as test oracle for each kernel).
 """
 from __future__ import annotations
+import warnings
 import torch
 from torch import Tensor
 from numba import cuda
 import numba.types as nbt
 
-from gpu_engine import GpuGameState, from_snapshots, compute_scores
+from numba.core.errors import NumbaPerformanceWarning
+warnings.filterwarnings("ignore", "Grid size", category=NumbaPerformanceWarning)
+
+from gpu_engine import GpuGameState, from_snapshots, compute_scores, compute_scores_tensor
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -652,9 +656,8 @@ def rollout_numba(
 	state: GpuGameState,
 	network,
 	max_steps: int = MAX_STEPS,
-) -> list[list[int]]:
-	"""Numba CUDA drop-in replacement for rollout_gpu / rollout_from_states_batched_v6.
-	Runs all games for max_steps (done games masked), returns round scores."""
+) -> Tensor:
+	"""Run all games for max_steps (done games masked), return [B, MAX_P] score tensor."""
 	from network import batched_masked_sample
 	B = state.done.shape[0]
 	dev = state.done.device
@@ -754,4 +757,4 @@ def rollout_numba(
 				d_apply_active, B,
 			)
 
-	return compute_scores(state)
+	return compute_scores_tensor(state)
