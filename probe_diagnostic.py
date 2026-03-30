@@ -189,10 +189,11 @@ def _make_network(layer_sizes):
     return ScoutNetwork(layer_sizes=layer_sizes)
 
 def _train_iteration(network, optimizer, records, value_loss_coeff=VALUE_LOSS_COEFF, verbose=False):
-    advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+    advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
     if verbose:
         rewards = [r.reward for r in records]
         mean_r = sum(rewards) / len(rewards)
+        adv_std = np.std(advantages)
         print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}")
     batch = prepare_ppo_batch(records, advantages, returns=returns)
     _pss = PLAY_START_SIZE_V3 if ENCODING_VERSION == 3 else (PLAY_START_SIZE_V2 if ENCODING_VERSION == 2 else PLAY_START_SIZE)

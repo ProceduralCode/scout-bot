@@ -30,7 +30,8 @@ def load_agent(spec: str) -> Agent:
 		else:
 			ls = [cfg.get("first_hidden_size", 256), cfg.get("hidden_size", 128)]
 		if ev == 6:
-			network = FlatScoutNetwork(INPUT_SIZE_V6, ls, encoding_version=6)
+			network = FlatScoutNetwork(INPUT_SIZE_V6, ls,
+				encoding_version=6, attention=cfg.get("attention"))
 		elif ev == 2:
 			network = ScoutNetwork(INPUT_SIZE_V2, ls,
 				play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,

@@ -745,10 +745,13 @@ NUM_VALUES_V6 = 10
 _N6 = NUM_VALUES_V6
 _H6 = HAND_SLOTS_V6
 HAND_DIM_V6 = _H6 * (_N6 + 2) + _H6           # 208
-SCOUT_CARDS_DIM_V6 = 4 * (_N6 + 1)             # 44
+SCOUT_CARDS_DIM_V6 = 4 * (_N6 + 1) + 8          # 52 (4 one-hot blocks + 4 top + 4 bottom scalars)
 PLAY_BUFFER_DIM_V6 = 16 + 5                     # 21
 METADATA_DIM_V6 = 28
-INPUT_SIZE_V6 = HAND_DIM_V6 + SCOUT_CARDS_DIM_V6 + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6  # 301
+INPUT_SIZE_V6 = HAND_DIM_V6 + SCOUT_CARDS_DIM_V6 + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6  # 309
+GLOBAL_START_V6 = HAND_DIM_V6 + SCOUT_CARDS_DIM_V6   # 260
+GLOBAL_DIM_V6 = PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6  # 49
+NUM_ENTITIES_V6 = _H6 + 4                             # 20
 FLAT_ACTION_SIZE = 384  # 256 play + 64 scout + 64 S&S
 
 def _fill_hand_v6(buf, offset, hand, hand_offset, N, H):
@@ -771,7 +774,7 @@ def _fill_hand_bottom_v6(buf, offset, hand, hand_offset, N, H):
 		buf[offset + slot] = card[1] / N
 
 def _fill_scout_cards_v6(buf, offset, current_play, N):
-	"""Write 4 scout card options, each N+1 dims: N one-hot face + absent flag.
+	"""Write 4 scout card options: 4×(N+1) one-hot blocks + 4 top scalars + 4 bottom scalars.
 	Order: left normal, left flipped, right normal, right flipped."""
 	card_size = N + 1
 	if current_play is None:
@@ -789,6 +792,17 @@ def _fill_scout_cards_v6(buf, offset, current_play, N):
 	else:
 		buf[offset + 2 * card_size + N] = 1.0              # right normal: absent
 		buf[offset + 3 * card_size + N] = 1.0              # right flipped: absent
+	# Top and bottom scalars for each scout option
+	s = offset + 4 * card_size
+	buf[s] = left[0] / N          # left normal top
+	buf[s + 1] = left[1] / N      # left flipped top
+	buf[s + 4] = left[1] / N      # left normal bottom
+	buf[s + 5] = left[0] / N      # left flipped bottom
+	if len(cards) > 1:
+		buf[s + 2] = right[0] / N  # right normal top
+		buf[s + 3] = right[1] / N  # right flipped top
+		buf[s + 6] = right[1] / N  # right normal bottom
+		buf[s + 7] = right[0] / N  # right flipped bottom
 
 def _fill_play_buffer_v6(buf, offset, current_play, N):
 	"""Write two 4-card buffers (top+bottom scalars /N) + play metadata.
@@ -853,7 +867,7 @@ def encode_state_v6(game, player, hand_offset, forced_play=False):
 	"""V6 state encoding: circular hand + scout cards + play buffers + metadata."""
 	N = game.num_values
 	H = HAND_SLOTS_V6
-	buf = np.zeros(H * (N + 2) + H + 4 * (N + 1) + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6,
+	buf = np.zeros(H * (N + 2) + H + SCOUT_CARDS_DIM_V6 + PLAY_BUFFER_DIM_V6 + METADATA_DIM_V6,
 		dtype=np.float32)
 	hand = game.players[player].hand
 	off = 0
@@ -862,7 +876,7 @@ def encode_state_v6(game, player, hand_offset, forced_play=False):
 	_fill_hand_bottom_v6(buf, off, hand, hand_offset, N, H)
 	off += H
 	_fill_scout_cards_v6(buf, off, game.current_play, N)
-	off += 4 * (N + 1)
+	off += SCOUT_CARDS_DIM_V6
 	_fill_play_buffer_v6(buf, off, game.current_play, N)
 	off += PLAY_BUFFER_DIM_V6
 	_fill_metadata_v6(buf, off, game, player, forced_play, H)
@@ -1018,5 +1032,9 @@ PLAY_PERM, SCOUT_PERM, FULL_PERM, HAND_SHIFT = _build_permutation_tables()
 # Override hot functions with Cython if compiled extension is available
 try:
 	from fast_game import get_legal_plays, _has_any_legal_play, _sns_variant_legal
+except ImportError:
+	pass
+try:
+	from fast_encoding import encode_state_v6, get_flat_action_mask
 except ImportError:
 	pass

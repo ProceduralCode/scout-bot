@@ -92,6 +92,30 @@ class Game:
 		self.flips_remaining: set[int] = set()
 		self.turn_number = 0
 
+	def clone(self) -> Game:
+		"""Fast shallow clone — all leaf values are immutable (tuples, ints, enums)."""
+		g = Game.__new__(Game)
+		g.num_players = self.num_players
+		g.num_values = self.num_values
+		g.total_rounds = self.total_rounds
+		g.round_number = self.round_number
+		g.current_player = self.current_player
+		g.scouts_since_play = self.scouts_since_play
+		g.turn_number = self.turn_number
+		g.round_ender = self.round_ender
+		g.starting_player = self.starting_player
+		g.phase = self.phase
+		g.current_play_owner = self.current_play_owner
+		g.cumulative_scores = self.cumulative_scores[:]
+		g.flips_remaining = set(self.flips_remaining)
+		p = self.current_play
+		g.current_play = Play(cards=p.cards[:], count=p.count, play_type=p.play_type, strength=p.strength) if p else None
+		g.players = [
+			PlayerState(hand=ps.hand[:], collected=ps.collected[:], scout_tokens=ps.scout_tokens, sns_available=ps.sns_available)
+			for ps in self.players
+		]
+		return g
+
 	def start_round(self):
 		"""Deal cards and enter flip decision phase."""
 		deck = create_deck(self.num_players, self.num_values)

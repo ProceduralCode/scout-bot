@@ -280,7 +280,7 @@ def main():
 		real_records.extend(records)
 
 	with timer("gae"):
-		advantages, returns, adv_std = compute_gae(real_records,
+		advantages, returns = compute_gae(real_records,
 			gamma=cfg.get("gamma", 0.99), lam=cfg.get("gae_lambda", 0.95))
 
 	# --- Phase 3: PPO update ---

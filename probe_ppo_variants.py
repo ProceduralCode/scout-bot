@@ -147,10 +147,11 @@ def _has_any_match(hand, card):
 	return any(c[0] == card[0] for c in hand)
 
 def _train_iteration(network, optimizer, records, verbose=False):
-	advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+	advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
 	if verbose:
 		rewards = [r.reward for r in records]
 		mean_r = sum(rewards) / len(rewards)
+		adv_std = np.std(advantages)
 		print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}")
 	batch = prepare_ppo_batch(records, advantages, returns=returns)
 	_pss = PLAY_START_SIZE_V3 if ENCODING_VERSION == 3 else (PLAY_START_SIZE_V2 if ENCODING_VERSION == 2 else PLAY_START_SIZE)
@@ -489,7 +490,7 @@ def test_hint(n_iters=300, n_games=200):
 			# This means the standard ppo_update won't work for this test.
 			# Let's do a simpler approach: direct policy gradient without PPO recomputation.
 			# Use REINFORCE-style: just weight the old log probs by advantage.
-			advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+			advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
 			verbose = (it % 50 == 0 or it == n_iters - 1)
 			if verbose:
 				rewards = [r.reward for r in records]
@@ -737,7 +738,7 @@ def test_gradient_compare(n_batches=20, n_games=500):
 			reward = 1.0 if adj else -1.0
 			records.append(_make_scout_record(sample, reward=reward, game_id=0))
 
-		advantages, returns, _ = compute_gae(records, gamma=0.99, lam=0.95)
+		advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
 		batch = prepare_ppo_batch(records, advantages, returns=returns)
 		# Compute PPO policy loss manually (scout_insert only)
 		states = torch.stack([s["state"] for _, s in samples])

@@ -7,6 +7,7 @@ from encoding import (
 	CNN_CHANNELS_V4, HAND_SLOTS_V4, FLAT_SIZE_V4, CNN_FLAT_SIZE_V4, INPUT_SIZE_V4,
 	PLAY_START_SIZE_V4, PLAY_END_SIZE_V4, SCOUT_INSERT_SIZE_V4,
 	FLAT_ACTION_SIZE,
+	GLOBAL_START_V6, GLOBAL_DIM_V6, NUM_ENTITIES_V6,
 )
 
 def build_conditioning(hidden: Tensor, action_type_idx: int | None, start_idx: int | None,
@@ -197,39 +198,129 @@ class CircularCNNScoutNetwork(nn.Module):
 		return self.scout_insert_head(conditioned)
 
 class FlatScoutNetwork(nn.Module):
-	"""V6 network: flat policy head over 384 actions. No conditioning or sequential heads."""
+	"""V6 network: optional self-attention over per-card entities → FC trunk → flat policy head."""
 
 	def __init__(self, input_size: int, layer_sizes: list[int] | None = None,
-				 encoding_version: int = 6):
+				 encoding_version: int = 6, attention: dict | None = None):
 		super().__init__()
 		if layer_sizes is None:
 			layer_sizes = [512, 256, 256, 128, 128, 128]
 		self.layer_sizes = layer_sizes
 		self.encoding_version = encoding_version
+		self.attention_cfg = attention
+		self._use_attention = attention is not None
 
-		# Shared trunk (same builder as ScoutNetwork)
+		if self._use_attention:
+			d_model = attention["dim"]
+			num_heads = attention["heads"]
+			num_layers = attention["layers"]
+			assert d_model % num_heads == 0, \
+				f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+			# Precomputed indices for gathering each entity's 13 features from flat input
+			entity_indices = torch.zeros(NUM_ENTITIES_V6, 13, dtype=torch.long)
+			for i in range(16):  # hand entities
+				for d in range(10):
+					entity_indices[i, d] = i * 12 + d       # one-hot value
+				entity_indices[i, 10] = i * 12 + 10          # empty flag
+				entity_indices[i, 11] = i * 12 + 11          # top scalar
+				entity_indices[i, 12] = 192 + i              # bottom scalar
+			for j in range(4):  # scout entities
+				for d in range(10):
+					entity_indices[16 + j, d] = 208 + j * 11 + d  # one-hot value
+				entity_indices[16 + j, 10] = 208 + j * 11 + 10    # absent flag
+				entity_indices[16 + j, 11] = 252 + j               # top scalar
+				entity_indices[16 + j, 12] = 256 + j               # bottom scalar
+			self.register_buffer('entity_indices', entity_indices)
+			self.register_buffer('position_onehots',
+				torch.eye(NUM_ENTITIES_V6).unsqueeze(0))
+			self.entity_proj = nn.Linear(13 + NUM_ENTITIES_V6, d_model)
+			self.attn_layers = nn.ModuleList()
+			for _ in range(num_layers):
+				self.attn_layers.append(nn.ModuleDict({
+					'norm': nn.LayerNorm(d_model),
+					'attn': nn.MultiheadAttention(d_model, num_heads, batch_first=True),
+				}))
+			trunk_input = NUM_ENTITIES_V6 * d_model + GLOBAL_DIM_V6
+		else:
+			trunk_input = input_size
+
+		# FC trunk
 		layers = []
-		prev_size = input_size
+		prev_size = trunk_input
 		for size in layer_sizes:
 			if size == prev_size:
 				layers.append(ResidualBlock(size))
 			else:
 				layers.append(nn.Linear(prev_size, size))
-				layers.append(nn.ReLU())
+				layers.append(nn.LayerNorm(size))
+				layers.append(nn.GELU())
 			prev_size = size
 		self.shared = nn.Sequential(*layers)
 
 		output_size = layer_sizes[-1]
-		self.value_head = nn.Linear(output_size, 1)
 		self.policy_head = nn.Linear(output_size, FLAT_ACTION_SIZE)
 
-	def forward(self, x: Tensor) -> Tensor:
-		return self.shared(x)
+		# Value head: detached multi-scale features (metadata + all trunk layer activations)
+		# No policy gradient flows into the value head; it reads trunk features passively
+		metadata_dim = GLOBAL_DIM_V6 if self._use_attention else input_size
+		value_input_dim = metadata_dim + sum(layer_sizes)
+		self.value_head = nn.Sequential(
+			nn.Linear(value_input_dim, 256),
+			nn.GELU(),
+			nn.Linear(256, 1),
+		)
 
-	def value(self, hidden: Tensor) -> Tensor:
-		return self.value_head(hidden)
+	def _run_trunk(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
+		"""Run input through trunk, return (final_hidden, per_layer_activations)."""
+		h = x
+		intermediates = []
+		for module in self.shared:
+			h = module(h)
+			if isinstance(module, (nn.GELU, nn.ReLU, ResidualBlock)):
+				intermediates.append(h)
+		return h, intermediates
 
-	def policy_logits(self, hidden: Tensor) -> Tensor:
+	def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+		"""Returns (hidden, value_context) tuple. Both are passed opaquely to value()/policy_logits()."""
+		if self._use_attention:
+			unbatched = x.ndim == 1
+			if unbatched:
+				x = x.unsqueeze(0)
+			# Gather per-entity features and concat positional encoding
+			entities = x[:, self.entity_indices]  # [batch, 20, 13]
+			pos = self.position_onehots.expand(x.shape[0], -1, -1)
+			entities = torch.cat([entities, pos], dim=2)  # [batch, 20, 33]
+			entities = self.entity_proj(entities)  # [batch, 20, d_model]
+			# Pre-norm self-attention with residual connections
+			for layer in self.attn_layers:
+				residual = entities
+				entities = layer['norm'](entities)
+				entities, _ = layer['attn'](entities, entities, entities)
+				entities = residual + entities
+			# Flatten attention output, concat global features, run FC trunk
+			combined = torch.cat([entities.flatten(1),
+				x[:, GLOBAL_START_V6:]], dim=1)
+			hidden, intermediates = self._run_trunk(combined)
+			# Value context: raw metadata + detached trunk activations
+			metadata = x[:, GLOBAL_START_V6:]
+			value_ctx = torch.cat(
+				[metadata.detach()] + [a.detach() for a in intermediates], dim=-1)
+			if unbatched:
+				hidden = hidden.squeeze(0)
+				value_ctx = value_ctx.squeeze(0)
+			return hidden, value_ctx
+		# No-attention path
+		hidden, intermediates = self._run_trunk(x)
+		value_ctx = torch.cat(
+			[x.detach()] + [a.detach() for a in intermediates], dim=-1)
+		return hidden, value_ctx
+
+	def value(self, h: Tensor | tuple) -> Tensor:
+		_, value_ctx = h
+		return self.value_head(value_ctx)
+
+	def policy_logits(self, h: Tensor | tuple) -> Tensor:
+		hidden, _ = h
 		return self.policy_head(hidden)
 
 class RandomBot:

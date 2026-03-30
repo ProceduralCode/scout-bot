@@ -200,10 +200,11 @@ def _train_iteration(network, optimizer, records, verbose=False,
 		entropy_floors = ENTROPY_FLOORS
 	if entropy_floor_coeff == "USE_GLOBAL":
 		entropy_floor_coeff = ENTROPY_FLOOR_COEFF
-	advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+	advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
 	if verbose:
 		rewards = [r.reward for r in records]
 		mean_r = sum(rewards) / len(rewards)
+		adv_std = np.std(advantages)
 		print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}  "
 			  f"returns_range=[{min(returns):.3f}, {max(returns):.3f}]")
 	batch = prepare_ppo_batch(records, advantages, returns=returns)
@@ -1091,10 +1092,11 @@ def probe_frozen_trunk_scout(n_iters=100, n_games=50):
 			if verbose:
 				print(f"  [8 iter {it}]")
 			# Use _train_iteration but with our optimizer
-			advantages, returns, adv_std = compute_gae(records, gamma=0.99, lam=0.95)
+			advantages, returns = compute_gae(records, gamma=0.99, lam=0.95)
 			if verbose:
 				rewards = [r.reward for r in records]
 				mean_r = sum(rewards) / len(rewards)
+				adv_std = np.std(advantages)
 				print(f"    records={len(records)}  mean_reward={mean_r:+.3f}  adv_std={adv_std:.4f}")
 			batch = prepare_ppo_batch(records, advantages, returns=returns)
 			for _ in range(PPO_EPOCHS):
