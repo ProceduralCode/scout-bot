@@ -2004,7 +2004,8 @@ def play_games_with_rollouts_v6(network, num_games: int, num_players: int,
 	return all_records, all_advantages, avg_margin_std
 
 def prepare_ppo_batch_v6(steps: list[StepRecordV6], advantages: list[float],
-						 returns: list[float] | None = None) -> dict | None:
+						 returns: list[float] | None = None,
+						 v_weights: list[float] | None = None) -> dict | None:
 	"""Pre-stack v6 StepRecords into a PPO batch. Simple: no sub-head indexing."""
 	n = len(steps)
 	if n == 0:
@@ -2021,6 +2022,8 @@ def prepare_ppo_batch_v6(steps: list[StepRecordV6], advantages: list[float],
 		batch["v_target"] = torch.tensor(returns, dtype=torch.float32)
 	else:
 		batch["v_target"] = torch.tensor([s.value for s in steps], dtype=torch.float32)
+	if v_weights is not None:
+		batch["v_weight"] = torch.tensor(v_weights, dtype=torch.float32)
 	return batch
 
 def subsample_batch_v6(batch: dict, keep_n: int) -> dict:
@@ -2029,7 +2032,7 @@ def subsample_batch_v6(batch: dict, keep_n: int) -> dict:
 	if keep_n >= n:
 		return batch
 	keep = torch.randperm(n)[:max(1, keep_n)].sort().values
-	return {
+	result = {
 		"n": len(keep),
 		"states": batch["states"][keep],
 		"masks": batch["masks"][keep],
@@ -2038,6 +2041,9 @@ def subsample_batch_v6(batch: dict, keep_n: int) -> dict:
 		"adv": batch["adv"][keep],
 		"v_target": batch["v_target"][keep],
 	}
+	if "v_weight" in batch:
+		result["v_weight"] = batch["v_weight"][keep]
+	return result
 
 def concatenate_batches_v6(batches: list[dict]) -> dict:
 	"""Concatenate v6 PPO batches, re-normalizing advantages."""
@@ -2051,6 +2057,14 @@ def concatenate_batches_v6(batches: list[dict]) -> dict:
 		"adv": torch.cat([b["adv"] for b in batches]),
 		"v_target": torch.cat([b["v_target"] for b in batches]),
 	}
+	if any("v_weight" in b for b in batches):
+		parts = []
+		for b in batches:
+			if "v_weight" in b:
+				parts.append(b["v_weight"])
+			else:
+				parts.append(torch.ones(b["n"]))
+		combined["v_weight"] = torch.cat(parts)
 	combined["n"] = combined["states"].shape[0]
 	adv = combined["adv"]
 	combined["adv"] = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -2059,7 +2073,7 @@ def concatenate_batches_v6(batches: list[dict]) -> dict:
 def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv, v_target,
 				 clip_epsilon, entropy_bonus, value_loss_coeff, max_grad_norm,
 				 entropy_floors=None, entropy_floor_coeff=1.0,
-				 zero_scout_policy_grad=False):
+				 zero_scout_policy_grad=False, v_weight=None):
 	"""Single PPO gradient step on one mini-batch. Returns metrics dict."""
 	dev = next(network.parameters()).device
 	states = states.to(dev)
@@ -2070,7 +2084,13 @@ def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv,
 	v_target = v_target.to(dev)
 	hidden = network(states)
 	v_pred = network.value(hidden).squeeze(-1)
-	value_loss = F.mse_loss(v_pred, v_target)
+	if v_weight is not None:
+		v_weight = v_weight.to(dev)
+		per_sample_vloss = (v_pred - v_target) ** 2
+		w_sum = v_weight.sum()
+		value_loss = (per_sample_vloss * v_weight).sum() / w_sum if w_sum > 0 else per_sample_vloss.mean()
+	else:
+		value_loss = F.mse_loss(v_pred, v_target)
 	logits = network.policy_logits(hidden)
 	new_log_probs = _batched_masked_log_prob(logits, masks, actions)
 	log_ratio = new_log_probs - old_log_probs
@@ -2133,8 +2153,33 @@ def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv,
 	with torch.no_grad():
 		clip_fraction = (torch.abs(ratio - 1.0) > clip_epsilon).float().mean().item()
 		approx_kl = ((ratio - 1) - log_ratio).mean().item()
-		v_err = (v_target - v_pred.detach()).var().item()
-		v_var = v_target.var().item()
+		# EV + value accuracy stats, only over samples the value head is trained on
+		if v_weight is not None:
+			ev_mask = v_weight > 0
+			n_ev = ev_mask.sum().item()
+			if n_ev > 1:
+				vt_ev = v_target[ev_mask]
+				vp_ev = v_pred.detach()[ev_mask]
+				v_err = (vt_ev - vp_ev).var().item()
+				v_var = vt_ev.var().item()
+			else:
+				v_err = 0.0
+				v_var = 0.0
+				vt_ev = v_target[:0]
+				vp_ev = v_pred.detach()[:0]
+		else:
+			n_ev = len(states)
+			vt_ev = v_target
+			vp_ev = v_pred.detach()
+			v_err = (vt_ev - vp_ev).var().item()
+			v_var = vt_ev.var().item()
+		# MAE and Pearson r running sums (aggregated across mini-batches)
+		v_mae_sum = (vt_ev - vp_ev).abs().sum().item() if n_ev > 0 else 0.0
+		sum_p = vp_ev.sum().item() if n_ev > 0 else 0.0
+		sum_t = vt_ev.sum().item() if n_ev > 0 else 0.0
+		sum_pp = (vp_ev * vp_ev).sum().item() if n_ev > 0 else 0.0
+		sum_tt = (vt_ev * vt_ev).sum().item() if n_ev > 0 else 0.0
+		sum_pt = (vp_ev * vt_ev).sum().item() if n_ev > 0 else 0.0
 		play_ent_sum = play_ent.sum().item() if play_ent is not None else 0.0
 		scout_ent_sum = scout_ent.sum().item() if scout_ent is not None else 0.0
 	n = len(states)
@@ -2145,7 +2190,10 @@ def _ppo_step_v6(network, optimizer, states, masks, actions, old_log_probs, adv,
 		"mean_ratio": ratio.sum().item(),
 		"clip_fraction": clip_fraction * n,
 		"approx_kl": approx_kl * n,
-		"v_err": v_err * n, "v_var": v_var * n,
+		"v_err": v_err * n_ev, "v_var": v_var * n_ev, "n_ev": n_ev,
+		"v_mae_sum": v_mae_sum,
+		"v_sum_p": sum_p, "v_sum_t": sum_t,
+		"v_sum_pp": sum_pp, "v_sum_tt": sum_tt, "v_sum_pt": sum_pt,
 		"entropy_play": play_ent_sum, "n_play": n_play,
 		"entropy_scout": scout_ent_sum, "n_scout": n_scout,
 		"entropy_floor_penalty": floor_penalty.item() * n,
@@ -2166,6 +2214,7 @@ def ppo_update_v6(network, optimizer: torch.optim.Optimizer,
 		"clip_fraction": 0.0, "approx_kl": 0.0, "explained_variance": 0.0,
 		"entropy_play": 0.0, "entropy_scout": 0.0,
 		"entropy_floor_penalty": 0.0,
+		"value_mae": 0.0, "value_corr": 0.0,
 	}
 	if batch is None:
 		return empty_metrics
@@ -2174,6 +2223,7 @@ def ppo_update_v6(network, optimizer: torch.optim.Optimizer,
 		chunks = [torch.arange(n)]
 	else:
 		chunks = torch.randperm(n).split(mini_batch_size)
+	has_vw = "v_weight" in batch
 	accum = []
 	for idx in chunks:
 		m = _ppo_step_v6(
@@ -2182,7 +2232,8 @@ def ppo_update_v6(network, optimizer: torch.optim.Optimizer,
 			batch["old_log_probs"][idx], batch["adv"][idx], batch["v_target"][idx],
 			clip_epsilon, entropy_bonus, value_loss_coeff, max_grad_norm,
 			entropy_floors=entropy_floors, entropy_floor_coeff=entropy_floor_coeff,
-			zero_scout_policy_grad=zero_scout_policy_grad)
+			zero_scout_policy_grad=zero_scout_policy_grad,
+			v_weight=batch["v_weight"][idx] if has_vw else None)
 		if m is None:
 			return empty_metrics
 		accum.append(m)
@@ -2193,8 +2244,23 @@ def ppo_update_v6(network, optimizer: torch.optim.Optimizer,
 	total_n = sum(m["n"] for m in accum)
 	total_play = sum(m["n_play"] for m in accum)
 	total_scout = sum(m["n_scout"] for m in accum)
-	total_v_var = sum(m["v_var"] for m in accum) / total_n
-	total_v_err = sum(m["v_err"] for m in accum) / total_n
+	total_n_ev = sum(m["n_ev"] for m in accum)
+	total_v_var = sum(m["v_var"] for m in accum) / total_n_ev if total_n_ev > 0 else 0.0
+	total_v_err = sum(m["v_err"] for m in accum) / total_n_ev if total_n_ev > 0 else 0.0
+	# Value MAE and Pearson correlation from running sums
+	value_mae = sum(m["v_mae_sum"] for m in accum) / total_n_ev if total_n_ev > 0 else 0.0
+	if total_n_ev > 1:
+		sp = sum(m["v_sum_p"] for m in accum)
+		st = sum(m["v_sum_t"] for m in accum)
+		spp = sum(m["v_sum_pp"] for m in accum)
+		stt = sum(m["v_sum_tt"] for m in accum)
+		spt = sum(m["v_sum_pt"] for m in accum)
+		N = total_n_ev
+		num = N * spt - sp * st
+		den = ((N * spp - sp * sp) * (N * stt - st * st)) ** 0.5
+		value_corr = num / den if den > 1e-12 else 0.0
+	else:
+		value_corr = 0.0
 	return {
 		"policy_loss": sum(m["policy_loss"] for m in accum) / total_n,
 		"value_loss": sum(m["value_loss"] for m in accum) / total_n,
@@ -2208,22 +2274,27 @@ def ppo_update_v6(network, optimizer: torch.optim.Optimizer,
 		"entropy_floor_penalty": sum(m["entropy_floor_penalty"] for m in accum) / total_n,
 		"kl_batches_used": len(accum),
 		"kl_batches_total": len(chunks),
+		"first_batch_ratio": accum[0]["mean_ratio"] / accum[0]["n"] if accum else 1.0,
+		"value_mae": value_mae,
+		"value_corr": value_corr,
 	}
 
 def augment_rotation_v6(steps: list[StepRecordV6], advantages: list[float],
-						network) -> tuple[list[StepRecordV6], list[float]]:
+						network, v_weights: list[float] | None = None,
+						) -> tuple[list[StepRecordV6], list[float], list[float] | None]:
 	"""Create 15 rotation-augmented copies of each training sample.
 	Shifts hand portion of state, permutes action index and mask.
 	Runs one batched forward pass per shift to compute correct old_log_probs.
-	Returns (original + augmented steps, original + augmented advantages)."""
+	Returns (original + augmented steps, original + augmented advantages, v_weights or None)."""
 	from encoding import FULL_PERM, HAND_SHIFT, HAND_SLOTS_V6
 	H = HAND_SLOTS_V6
 	n = len(steps)
 	if n == 0:
-		return steps, advantages
+		return steps, advantages, v_weights
 
 	all_steps = list(steps)
 	all_advs = list(advantages)
+	all_vw = list(v_weights) if v_weights is not None else None
 
 	# Stack originals for vectorized permutation (CPU — permutation tables are CPU)
 	orig_states = torch.stack([s.state for s in steps])             # [n, 301]
@@ -2268,5 +2339,7 @@ def augment_rotation_v6(steps: list[StepRecordV6], advantages: list[float],
 					scout_quality=step.scout_quality,
 				))
 				all_advs.append(adv)
+				if all_vw is not None:
+					all_vw.append(v_weights[i])
 
-	return all_steps, all_advs
+	return all_steps, all_advs, all_vw

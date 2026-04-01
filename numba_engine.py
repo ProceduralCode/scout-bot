@@ -727,8 +727,17 @@ def rollout_numba(
 			)
 
 			# 4. Network forward + sampling (PyTorch, stays on GPU)
-			h = network(encode_buf)
-			logits = network.policy_logits(h)
+			# Chunk forward pass to avoid GPU memory saturation on large batches
+			CHUNK = 1 << 10  # 1024 — peak throughput on RTX 3060 (bench_batch_size.py)
+			if B <= CHUNK:
+				h = network(encode_buf)
+				logits = network.policy_logits(h)
+			else:
+				logits = torch.empty(B, FLAT_ACTION_SIZE, device=dev)
+				for start in range(0, B, CHUNK):
+					end = min(start + CHUNK, B)
+					h_chunk = network(encode_buf[start:end])
+					logits[start:end] = network.policy_logits(h_chunk)
 
 			# Advance turn for active games with no legal actions
 			has_action = mask_buf.any(dim=1)

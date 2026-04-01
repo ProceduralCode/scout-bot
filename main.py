@@ -27,32 +27,46 @@ from training import (
 from game_log import GameLog
 from probe import eval_scout_quality
 
+"""
+Ideas:
+- Simulate extra sample games and do rollouts and training signal for an equal distribution across possible action output nodes (do the same number of rollouts on some triple play vs some single play)
+- Increase rollouts to 50 to get good signal
+- Use a different training mechanism than PPO
+- Make the rollouts have sampling temperature
+- Consider making the policy network predict margin difference for each move instead of which move to take
+"""
+
 PARAMS = {
 	"num_players": 4,
-	# "layer_sizes": [256, 128],  # old shallow network
-	"layer_sizes": [512, 256, 128],
+	"layer_sizes": [256, 128],
+	# "layer_sizes": [512, 256, 128],
 	# "layer_sizes": [512, 256, 256, 128, 128, 128],
 	# "learning_rate": 0.0001,
-	"learning_rate": 0.0003, # base
+	# "learning_rate": 0.0003, # base
 	# "learning_rate": 0.0006,
 	# "learning_rate": 0.001,
 	# "learning_rate": 0.003,
+	"learning_rate": "adaptive",
+	"lr_initial": 0.0003,
+	"lr_min": 0.000001,
+	"lr_max": 0.01,
 	# "mini_batch_size": 2**12,
 	# "mini_batch_size": 2**13,
 	"mini_batch_size": 2**14,
 	# "mini_batch_size": 2**15,
 	"games_per_iteration": 100,
 	# "games_per_iteration": 4,
-	"ppo_epochs": 1,
+	# "ppo_epochs": 1,
 	# "ppo_epochs": 2,
+	"ppo_epochs": 3,
 	# "ppo_epochs": 4, # passes over the batch per iteration
 	# "ppo_epochs": 8,
 	# "replay_past": [0.4, 0.2, 0.1, 0.1, 0.1],  # fraction of current batch to keep from past iterations ([] = no buffer)
 	"replay_past": [],
 	"clip_epsilon": 0.2,
 	# "entropy_bonus": 0.01,
-	"entropy_bonus": 0.03,
-	# "entropy_bonus": 0.05,
+	# "entropy_bonus": 0.03,
+	"entropy_bonus": 0.05,
 	# "entropy_bonus": 0.08,
 	# "entropy_floors": {
 	# 	"action_type": 0.05,
@@ -63,13 +77,15 @@ PARAMS = {
 	# v6 entropy floors: quadratic penalty when region entropy drops below floor
 	# "entropy_floors": {
 	# 	"play": 1.0,
-	# 	"scout": 1.0,
+	# 	"scout": 2.5,
 	# },
 	"entropy_floors": None,
 	"entropy_floor_coeff": 1.0,
 	# Ablation: zero all gradient on policy_head rows 256-319 (scout logits)
 	"zero_scout_policy_grad": False,
-	"kl_target": 0.015,
+	# "kl_target": 0.015,
+	"kl_target": 0.01,
+	# "kl_target": 0.005,
 	"reward_mode": "game_score",  # "game_score", "play_length", or "play_and_scout"
 	"reward_distribution": 0.7,  # "terminal", "uniform", or 0-1 uniform fraction (game_score mode only)
 	# Used this for a while to start training like 2,000 iterations and then turned it off.
@@ -79,7 +95,7 @@ PARAMS = {
 	"value_loss_coeff": 0.5,
 	# "gamma": 0.99,
 	"gamma": 0.995,
-	"gae_lambda": 0.95,
+	"gae_lambda": 0.98,
 	"training_seats": 4,
 	"opponent_pool_size": 10,
 	"snapshot_interval": 30, # add to pool every N iterations
@@ -100,15 +116,16 @@ PARAMS = {
 	"rollouts_per_state": 20,  # N rollout games from each decision point
 	# "rollout_fraction": 0.1,  # fraction of games_per_iteration to use rollouts instead of GAE
 	# "rollout_fraction": 0.05,
-	"rollout_fraction": 0.25,
-	# "sampling_temperature": 1.5,  # >1.0 flattens sampling for exploration; recorded in old_log_prob so PPO ratios are correct
-	"sampling_temperature": 2.5,
+	# "rollout_fraction": 0.1,
+	# "rollout_fraction": 0.25,
+	"rollout_fraction": 1.0,
+	"sampling_temperature": 1.0,
+	"gae_vloss_weight": 0.0,  # weight of GAE samples in value loss (0=rollout-only, 1=equal)
 	"augment_rotations": 16,  # 1 = no augmentation, 16 = all rotations
 	"use_direct_pg": False,  # vanilla policy gradient instead of PPO (forces 1 epoch)
 	"diagnose": False,  # per-iteration diagnostics: raw advantages by action type, policy prefs, value accuracy
 	"attention": {"dim": 32, "heads": 2, "layers": 1},
-	# "save_dir": "bots/v7_5",
-	"save_dir": "bots/v7_7",
+	"save_dir": "bots/v7_12",
 	"eval_opponents": {
 		# "random": "random", # magic word → uses RandomBot
 		"v1_4": "bots/v1_4/latest.pt",
@@ -117,6 +134,92 @@ PARAMS = {
 		"v4_2": "bots/v4_2/latest.pt",
 	}, # name → checkpoint path (or "random" for RandomBot)
 }
+
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_2"
+
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["entropy_bonus"] = 0.0
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_3"
+
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["entropy_bonus"] = 0.0
+# PARAMS["sampling_temperature"] = 1.5
+# PARAMS["entropy_foors"] = {
+# 	"play": 0.2,
+# 	"scout": 0.2,
+# }
+# PARAMS["eval_opponents"] = {}
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_4"
+
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["entropy_bonus"] = 0.0
+# PARAMS["sampling_temperature"] = 1.0
+# PARAMS["entropy_foors"] = {
+# 	"play": 0.2,
+# 	"scout": 0.2,
+# }
+# PARAMS["eval_opponents"] = {}
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_5"
+
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["entropy_bonus"] = 0.005
+# PARAMS["sampling_temperature"] = 1.5
+# PARAMS["entropy_foors"] = {
+# 	"play": 0.2,
+# 	"scout": 0.2,
+# }
+# PARAMS["eval_opponents"] = {}
+# PARAMS["games_per_iteration"] = 1000
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_6"
+
+# Temp probe test
+PARAMS["rollout_fraction"] = 0.0
+PARAMS["reward_mode"] = "play_length"
+PARAMS["gae_vloss_weight"] = 1.0
+PARAMS["gamma"] = 0.0
+PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+PARAMS["entropy_bonus"] = 0.005
+PARAMS["sampling_temperature"] = 1.5
+PARAMS["entropy_foors"] = {
+	"play": 0.2,
+	"scout": 0.2,
+}
+PARAMS["eval_opponents"] = {}
+PARAMS["games_per_iteration"] = 300
+PARAMS["rollouts_per_state"] = 50
+PARAMS["save_dir"] = "bots/v7_play_len_probe_7"
 
 def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, filename, pool=None, extra=None):
 	path = os.path.join(save_dir, filename)
@@ -486,48 +589,76 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 		plot_line(axes[1, 3], "value_loss", "Value Loss",
 			"MSE between predicted and actual returns. Should decrease as value function improves.", "#ffa552")
 
-		# Row 2: Entropy + KL
+		# Row 2: PPO diagnostics
+		plot_line(axes[2, 0], "clip_fraction", "Clip Fraction",
+			"Fraction of samples clipped by PPO. High = policy changing too fast.", "#ff922b")
+		ax_kl = axes[2, 1]
+		plot_line(ax_kl, "approx_kl", "Approx KL",
+			"How far policy moved from collection policy. Dashed line = early stop threshold.", "#74c0fc")
+		kl_tgt = cfg.get("kl_target", 0.015) if cfg else 0.015
+		ax_kl.axhline(y=kl_tgt, color="#ff6b6b", linestyle="--", alpha=0.7, linewidth=1)
+		plot_line(axes[2, 2], "kl_batch_frac", "KL Early Stop",
+			"Fraction of mini-batches used before KL early stop. 1.0 = no early stop triggered.", "#ffa552")
+		plot_line(axes[2, 3], "lr", "Learning Rate",
+			"Current LR. Adaptive: nudged by 0.9x/1.1x based on KL vs target.", "#74c0fc")
+
+		# Row 3: Network health + value accuracy
 		if "entropy_play" in trimmed and trimmed["entropy_play"]:
-			plot_multi(axes[2, 0], [
+			plot_multi(axes[3, 0], [
 				("entropy", "Total", "#69db7c"),
 				("entropy_play", "Play Only", "#5dadec"),
 				("entropy_scout", "Scout Only", "#ff6b6b"),
 			], "Conditional Entropies",
 				"Flat-head entropy. Play/Scout are conditional on masking other regions. Low = converging.")
 		else:
-			plot_multi(axes[2, 0], [
+			plot_multi(axes[3, 0], [
 				("entropy_action_type", "Action Type", "#69db7c"),
 				("entropy_play_start", "Play Start", "#5dadec"),
 				("entropy_play_end", "Play End", "#ffa552"),
 				("entropy_scout_insert", "Scout Insert", "#ff6b6b"),
 			], "Per-Head Entropy",
 				"Entropy per head (steps with 2+ options only). Collapsing = premature convergence.")
-		plot_line(axes[2, 1], "entropy_floor_penalty", "Entropy Floor Penalty",
-			"Quadratic penalty when head entropy drops below floor. >0 = floor active. 0 = heads above floor.", "#ff922b")
-		ax_kl = axes[2, 2]
-		plot_line(ax_kl, "approx_kl", "Approx KL",
-			"How far policy moved from collection policy. Dashed line = early stop threshold.", "#74c0fc")
-		kl_tgt = cfg.get("kl_target", 0.015) if cfg else 0.015
-		ax_kl.axhline(y=kl_tgt, color="#ff6b6b", linestyle="--", alpha=0.7, linewidth=1)
-		plot_line(axes[2, 3], "kl_batch_frac", "KL Early Stop",
-			"Fraction of mini-batches used before KL early stop. 1.0 = no early stop triggered.", "#ffa552")
-
-		# Row 3: Network health
-		plot_multi(axes[3, 0], [
+		plot_multi(axes[3, 1], [
 			("dormant_neurons_layer_0", "Layer 0", "#ff6b6b"),
 			("dormant_neurons_layer_1", "Layer 1", "#ffa552"),
 			("dormant_neurons_layer_2", "Layer 2", "#69db7c"),
 			("dormant_neurons_total", "Total", "#e0aaff"),
 		], "Dormant Neurons",
 			"Neurons with mean |activation| < 0.01 across batch. High count = underutilized capacity.")
-		plot_line(axes[3, 1], "clip_fraction", "Clip Fraction",
-			"Fraction of samples clipped by PPO. <0.01 typical with masked multi-head actions.", "#ff922b")
 		plot_multi(axes[3, 2], [
 			("explained_variance", "GAE", "#69db7c"),
 			("rollout_ev", "Rollout", "#5dadec"),
 		], "Explained Variance",
-			"Value head accuracy. GAE = vs GAE returns (circular). Rollout = vs empirical ground truth.")
-		axes[3, 3].set_visible(False)
+			"Value prediction accuracy. GAE = vs bootstrap returns. Rollout = vs ground truth.")
+		# Value accuracy: MAE (left axis) + Pearson correlation (right axis)
+		ax_mae = axes[3, 3]
+		ax_mae.set_facecolor(PANEL)
+		if "value_mae" in trimmed:
+			ax_mae.plot(iters[-len(trimmed["value_mae"]):], trimmed["value_mae"],
+						alpha=0.25, color="#ffa552", linewidth=0.8)
+			ax_mae.plot(iters[-len(smoothed["value_mae"]):], smoothed["value_mae"],
+						color="#ffa552", linewidth=2, label="MAE")
+		ax_mae.set_ylabel("MAE", color="#ffa552", fontsize=8)
+		ax_mae.tick_params(axis="y", colors="#ffa552", labelsize=8)
+		ax_corr = ax_mae.twinx()
+		if "value_corr" in trimmed:
+			ax_corr.plot(iters[-len(trimmed["value_corr"]):], trimmed["value_corr"],
+						 alpha=0.25, color="#69db7c", linewidth=0.8)
+			ax_corr.plot(iters[-len(smoothed["value_corr"]):], smoothed["value_corr"],
+						 color="#69db7c", linewidth=2, label="Correlation")
+		ax_corr.set_ylabel("Correlation", color="#69db7c", fontsize=8)
+		ax_corr.tick_params(axis="y", colors="#69db7c", labelsize=8)
+		# Combined legend
+		lines1, labels1 = ax_mae.get_legend_handles_labels()
+		lines2, labels2 = ax_corr.get_legend_handles_labels()
+		if lines1 or lines2:
+			ax_mae.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
+		ax_mae.set_title("Value Accuracy", color=TEXT, fontsize=11)
+		ax_mae.text(0.5, -0.15, textwrap.fill(
+			"MAE = avg error in margin points (lower = better). Correlation = does ranking match (higher = better).", 45),
+			transform=ax_mae.transAxes, ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+		ax_mae.tick_params(axis="x", colors=SUBTEXT, labelsize=8)
+		ax_mae.grid(True, alpha=0.15, color=GRID)
 
 		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
 						   hspace=0.40, wspace=0.25)
@@ -543,7 +674,7 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 	lines = [f"=== Run: {len(iters)} iterations (trimmed first {trim}) ===\n"]
 
 	def _snap_idx(n):
-		count = min(n, 5)
+		count = min(n, 10)
 		step = (n - 1) / (count - 1) if count > 1 else 0
 		return [round(i * step) for i in range(count)]
 
@@ -688,7 +819,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
 	else:
 		network = ScoutNetwork(input_size=INPUT_SIZE, layer_sizes=cfg["layer_sizes"])
-	optimizer = torch.optim.Adam(network.parameters(), lr=cfg["learning_rate"])
+	initial_lr = cfg.get("lr_initial", 3e-4) if cfg["learning_rate"] == "adaptive" else cfg["learning_rate"]
+	optimizer = torch.optim.Adam(network.parameters(), lr=initial_lr)
+	current_lr = initial_lr
 	metrics_history = {
 		"iteration": [], "reward": [], "value": [],
 		"policy_loss": [], "value_loss": [], "entropy": [],
@@ -719,6 +852,10 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		"kl_batch_frac": [],
 		# Rollout value accuracy (EV against rollout ground truth)
 		"rollout_ev": [],
+		# Value prediction accuracy (MAE + Pearson correlation vs rollout targets)
+		"value_mae": [], "value_corr": [],
+		# Learning rate tracking
+		"lr": [],
 	}
 	start_iter = 1
 	# Auto-resume if save dir has a checkpoint
@@ -751,6 +888,8 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			cfg["encoding_version"] = saved_cfg["encoding_version"]
 		if "attention" in saved_cfg:
 			cfg["attention"] = saved_cfg["attention"]
+		if "current_lr" in checkpoint:
+			current_lr = checkpoint["current_lr"]
 		print(f"Resumed from iteration {start_iter - 1}")
 	pool = OpponentPool(max_size=cfg["opponent_pool_size"])
 	if os.path.exists(resume_path):
@@ -831,9 +970,10 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					temperature=cfg.get("sampling_temperature", 1.0))
 				raw_advantages = list(advantages)
 				original_records = iteration_records  # pre-augmentation copy for metrics
+				v_weights = None  # all rollout, no distinction needed
 				if cfg.get("augment_rotations", 1) > 1:
-					iteration_records, advantages = augment_rotation_v6(
-						iteration_records, advantages, network)
+					iteration_records, advantages, v_weights = augment_rotation_v6(
+						iteration_records, advantages, network, v_weights=v_weights)
 				returns = None  # prepare_ppo_batch_v6 uses record.value
 			elif ev == 6:
 				rollout_frac = cfg.get("rollout_fraction", 0.0)
@@ -849,13 +989,23 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					reward_mode=cfg.get("reward_mode", "game_score"),
 					shaped_bonus_scale=cfg.get("shaped_bonus_scale", 0.0),
 					temperature=cfg.get("sampling_temperature", 1.0))
-				gae_advantages, gae_returns = compute_gae(
-					gae_records, gamma=cfg["gamma"], lam=cfg["gae_lambda"])
-				raw_advantages = [ret - rec.value for rec, ret in zip(gae_records, gae_returns)]
-				for rec, ret in zip(gae_records, gae_returns):
-					rec.value = ret  # overwrite with GAE return (value target)
+				if cfg.get("value_baseline") == "mean":
+					# Bypass learned V(s): advantage = reward - batch_mean(reward)
+					rewards = [rec.reward for rec in gae_records]
+					mean_r = sum(rewards) / max(len(rewards), 1)
+					gae_advantages = [r - mean_r for r in rewards]
+					raw_advantages = list(gae_advantages)
+					for rec in gae_records:
+						rec.value = rec.reward  # value target = raw reward (unused with vloss=0)
+				else:
+					gae_advantages, gae_returns = compute_gae(
+						gae_records, gamma=cfg["gamma"], lam=cfg["gae_lambda"])
+					raw_advantages = [ret - rec.value for rec, ret in zip(gae_records, gae_returns)]
+					for rec, ret in zip(gae_records, gae_returns):
+						rec.value = ret  # overwrite with GAE return (value target)
 				# Rollout games (high-quality value targets and advantages)
 				rollout_time = 0.0
+				gae_vw = cfg.get("gae_vloss_weight", 1.0)
 				if n_rollout > 0:
 					t_ro = time.time()
 					ro_records, ro_advantages, rollout_margin_std = play_games_with_rollouts_v6(
@@ -876,15 +1026,17 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					advantages = gae_advantages + ro_advantages
 					iteration_records = gae_records + ro_records
 					raw_advantages = raw_advantages + ro_advantages
+					v_weights = [gae_vw] * len(gae_records) + [1.0] * len(ro_records)
 					rollout_time = time.time() - t_ro
 				else:
 					iteration_records = gae_records
 					advantages = gae_advantages
+					v_weights = None  # all GAE, no distinction needed
 					rollout_margin_std = 0.0
 				original_records = iteration_records
 				if cfg.get("augment_rotations", 1) > 1:
-					iteration_records, advantages = augment_rotation_v6(
-						iteration_records, advantages, network)
+					iteration_records, advantages, v_weights = augment_rotation_v6(
+						iteration_records, advantages, network, v_weights=v_weights)
 				returns = None  # prepare_ppo_batch_v6 uses record.value
 			elif cfg.get("use_rollouts"):
 				iteration_records, advantages = play_games_with_rollouts(
@@ -915,15 +1067,17 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 											rollout_margin_std, cfg.get("rollouts_per_state", 25))
 			# PPO training — on-policy, all steps from this iteration
 			network.train()
-			# LR annealing: linear decay to 0 (disabled for short diagnostic runs)
-			if cfg["total_iterations"] <= 1000:
+			# LR: adaptive (KL-based) or linear decay
+			if cfg["learning_rate"] == "adaptive":
+				lr = current_lr
+			elif cfg["total_iterations"] <= 1000:
 				lr = cfg["learning_rate"]
 			else:
 				lr = cfg["learning_rate"] * (1 - iteration / cfg["total_iterations"])
 			optimizer.param_groups[0]["lr"] = lr
 			use_dpg = cfg.get("use_direct_pg", False)
 			if ev == 6:
-				batch = prepare_ppo_batch_v6(iteration_records, advantages)
+				batch = prepare_ppo_batch_v6(iteration_records, advantages, v_weights=v_weights)
 				if batch is not None and replay_buffer is not None:
 					replay_buffer.append(batch)
 					buf = list(replay_buffer)
@@ -963,9 +1117,9 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 						zero_scout_policy_grad=cfg.get("zero_scout_policy_grad", False),
 					kl_target=cfg.get("kl_target", 0.015),
 					)
-					# Epoch 0: ratios must be ~1.0 (catches old_log_prob recording bugs)
-					if epoch == 0 and (not replay_buffer or len(replay_buffer) <= 1) and abs(m["mean_ratio"] - 1.0) > 0.01:
-						print(f"  WARNING: epoch 0 mean ratio={m['mean_ratio']:.4f} (expected ~1.0)")
+					# Epoch 0, first mini-batch: ratio must be ~1.0 (catches old_log_prob recording bugs)
+					if epoch == 0 and (not replay_buffer or len(replay_buffer) <= 1) and abs(m.get("first_batch_ratio", 1.0) - 1.0) > 0.01:
+						print(f"  WARNING: epoch 0 first-batch ratio={m['first_batch_ratio']:.4f} (expected ~1.0)")
 				elif use_dpg:
 					m = direct_pg_update(
 						network, optimizer, training_batch,
@@ -996,6 +1150,15 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			actual_epochs = epoch + 1
 			ppo_avg = {k: v / actual_epochs for k, v in ppo_sums.items()}
 			train_time = time.time() - t0 - play_time
+			# Adaptive LR: nudge based on observed KL vs target
+			if cfg["learning_rate"] == "adaptive":
+				obs_kl = ppo_avg.get("approx_kl", 0)
+				kl_tgt = cfg.get("kl_target", 0.015)
+				old_lr = current_lr
+				if obs_kl > kl_tgt:
+					current_lr = max(current_lr * 0.9, cfg.get("lr_min", 1e-5))
+				elif obs_kl < kl_tgt:
+					current_lr = min(current_lr * 1.1, cfg.get("lr_max", 3e-3))
 			# Snapshot to opponent pool
 			if iteration % cfg["snapshot_interval"] == 0:
 				pool.add(network)
@@ -1049,7 +1212,8 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 				if ev == 6:
 					for k in ("policy_loss", "value_loss", "entropy",
 							  "clip_fraction", "approx_kl", "explained_variance",
-							  "entropy_play", "entropy_scout"):
+							  "entropy_play", "entropy_scout",
+							  "value_mae", "value_corr"):
 						metrics_history[k].append(ppo_avg.get(k, 0.0))
 					used = ppo_avg.get("kl_batches_used", 1)
 					total = ppo_avg.get("kl_batches_total", 1)
@@ -1070,6 +1234,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
 				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
 				metrics_history["reward_std"].append(reward_std)
+				metrics_history["lr"].append(lr)
 				if diag is not None:
 					for k in ("adv_std", "adv_abs_mean", "adv_p10", "adv_p90",
 							  "rollout_noise", "snr",
@@ -1081,7 +1246,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 					  f"reward={avg_reward:+.3f}  value={avg_value:+.3f}  "
 					  f"ploss={ppo_avg['policy_loss']:.4f}  vloss={ppo_avg['value_loss']:.4f}  "
 					  f"ent={ppo_avg['entropy']:.3f}  clip={ppo_avg['clip_fraction']:.2f}  "
-					  f"kl={ppo_avg['approx_kl']:.4f}  ev={ppo_avg['explained_variance']:.2f}  "
+					  f"kl={ppo_avg['approx_kl']:.4f}  ev={ppo_avg['explained_variance']:.2f}  lr={lr:.1e}  "
 					  f"steps={n_steps}{buf_str}  pool={len(pool.versions)}  "
 					  f"play={play_time:.1f}s  train={train_time:.1f}s"
 					  f"{'  ro=' + f'{rollout_time:.1f}s' if rollout_time > 0 else ''}"
@@ -1092,7 +1257,8 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 						  f"P(1)={diag['policy_p_single']:.2f} P(2)={diag['policy_p_pair']:.2f} "
 						  f"P(3+)={diag['policy_p_3plus']:.2f}  "
 						  f"v_mae={diag['value_mae']:.3f} v_corr={diag['value_corr']:.2f}")
-				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
+				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool,
+								extra={"current_lr": current_lr})
 			# Periodic snapshots (time-based or iteration-based)
 			now = time.time()
 			save_hours = cfg.get("save_interval_hours")
@@ -1104,7 +1270,7 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			if save_snapshot:
 				last_snapshot_time = now
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
-								save_dir, f"iter_{iteration}.pt")
+								save_dir, f"iter_{iteration}.pt", extra={"current_lr": current_lr})
 				# Save a sample game log for replay
 				log = GameLog(num_players=cfg["num_players"])
 				network.eval()
@@ -1139,7 +1305,8 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 			print(profiler.output_text(unicode=False, color=False))
 		return
 	# Final save
-	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool)
+	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt", pool=pool,
+					extra={"current_lr": current_lr})
 	_save_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	if cfg.get("diagnose"):
 		_save_diagnostic_charts(metrics_history, save_dir)
