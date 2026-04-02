@@ -32,7 +32,7 @@ PLAY_NONE = 0
 PLAY_SET = 1
 PLAY_RUN = 2
 
-MAX_STEPS = 100
+MAX_STEPS = 1000
 
 TPB = 256  # threads per block
 
@@ -656,8 +656,10 @@ def rollout_numba(
 	state: GpuGameState,
 	network,
 	max_steps: int = MAX_STEPS,
+	temperature: float = 1.0,
 ) -> Tensor:
-	"""Run all games for max_steps (done games masked), return [B, MAX_P] score tensor."""
+	"""Run all games until done (or max_steps if set), return [B, MAX_P] score tensor.
+	temperature: action sampling temperature (1.0 = softmax, 0.0 = greedy)."""
 	from network import batched_masked_sample
 	B = state.done.shape[0]
 	dev = state.done.device
@@ -692,12 +694,22 @@ def rollout_numba(
 
 	grid = _grid(B)
 
+	# Pre-allocate logits buffer (reused each step, only active slots updated)
+	logits = torch.zeros(B, FLAT_ACTION_SIZE, device=dev)
+
 	network.eval()
 	with torch.no_grad():
-		for step in range(max_steps):
-			active = ~state.done
-			if not active.any():
+		step = 0
+		while True:
+			# Get active game indices (single sync replaces active.any() check)
+			active_idx = torch.where(~state.done)[0]
+			if active_idx.shape[0] == 0:
 				break
+			if max_steps is not None and step >= max_steps:
+				break
+			step += 1
+			active = ~state.done
+			n_active = active_idx.shape[0]
 
 			hand_offsets = torch.randint(0, H, (B,), device=dev, dtype=torch.long)
 			d_offsets = cuda.as_cuda_array(hand_offsets)
@@ -726,18 +738,17 @@ def rollout_numba(
 				d_collected, d_scout_tokens, d_offsets, d_encode, B,
 			)
 
-			# 4. Network forward + sampling (PyTorch, stays on GPU)
-			# Chunk forward pass to avoid GPU memory saturation on large batches
+			# 4. Network forward — only on active games
 			CHUNK = 1 << 10  # 1024 — peak throughput on RTX 3060 (bench_batch_size.py)
-			if B <= CHUNK:
-				h = network(encode_buf)
-				logits = network.policy_logits(h)
+			if n_active <= CHUNK:
+				h = network(encode_buf[active_idx])
+				logits[active_idx] = network.policy_logits(h)
 			else:
-				logits = torch.empty(B, FLAT_ACTION_SIZE, device=dev)
-				for start in range(0, B, CHUNK):
-					end = min(start + CHUNK, B)
-					h_chunk = network(encode_buf[start:end])
-					logits[start:end] = network.policy_logits(h_chunk)
+				for start in range(0, n_active, CHUNK):
+					end = min(start + CHUNK, n_active)
+					idx = active_idx[start:end]
+					h_chunk = network(encode_buf[idx])
+					logits[idx] = network.policy_logits(h_chunk)
 
 			# Advance turn for active games with no legal actions
 			has_action = mask_buf.any(dim=1)
@@ -750,7 +761,12 @@ def rollout_numba(
 				# Re-wrap since torch.where creates a new tensor
 				d_current_player = cuda.as_cuda_array(state.current_player)
 
-			actions = batched_masked_sample(logits, mask_buf)
+			if temperature == 0.0:
+				actions = logits.masked_fill(~mask_buf, float('-inf')).argmax(dim=1)
+			elif temperature != 1.0:
+				actions = batched_masked_sample(logits / temperature, mask_buf)
+			else:
+				actions = batched_masked_sample(logits, mask_buf)
 			d_actions = cuda.as_cuda_array(actions)
 			apply_active = active & has_action
 			d_apply_active = cuda.as_cuda_array(apply_active)

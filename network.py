@@ -198,7 +198,8 @@ class CircularCNNScoutNetwork(nn.Module):
 		return self.scout_insert_head(conditioned)
 
 class FlatScoutNetwork(nn.Module):
-	"""V6 network: optional self-attention over per-card entities → FC trunk → flat policy head."""
+	"""V6 network: optional self-attention over per-card entities → FC trunk → flat head.
+	Outputs 384 predicted margins (one per possible action)."""
 
 	def __init__(self, input_size: int, layer_sizes: list[int] | None = None,
 				 encoding_version: int = 6, attention: dict | None = None):
@@ -260,28 +261,8 @@ class FlatScoutNetwork(nn.Module):
 		output_size = layer_sizes[-1]
 		self.policy_head = nn.Linear(output_size, FLAT_ACTION_SIZE)
 
-		# Value head: detached multi-scale features (metadata + all trunk layer activations)
-		# No policy gradient flows into the value head; it reads trunk features passively
-		metadata_dim = GLOBAL_DIM_V6 if self._use_attention else input_size
-		value_input_dim = metadata_dim + sum(layer_sizes)
-		self.value_head = nn.Sequential(
-			nn.Linear(value_input_dim, 256),
-			nn.GELU(),
-			nn.Linear(256, 1),
-		)
-
-	def _run_trunk(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
-		"""Run input through trunk, return (final_hidden, per_layer_activations)."""
-		h = x
-		intermediates = []
-		for module in self.shared:
-			h = module(h)
-			if isinstance(module, (nn.GELU, nn.ReLU, ResidualBlock)):
-				intermediates.append(h)
-		return h, intermediates
-
-	def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-		"""Returns (hidden, value_context) tuple. Both are passed opaquely to value()/policy_logits()."""
+	def forward(self, x: Tensor) -> Tensor:
+		"""Returns hidden representation from trunk."""
 		if self._use_attention:
 			unbatched = x.ndim == 1
 			if unbatched:
@@ -300,28 +281,20 @@ class FlatScoutNetwork(nn.Module):
 			# Flatten attention output, concat global features, run FC trunk
 			combined = torch.cat([entities.flatten(1),
 				x[:, GLOBAL_START_V6:]], dim=1)
-			hidden, intermediates = self._run_trunk(combined)
-			# Value context: raw metadata + detached trunk activations
-			metadata = x[:, GLOBAL_START_V6:]
-			value_ctx = torch.cat(
-				[metadata.detach()] + [a.detach() for a in intermediates], dim=-1)
+			hidden = self.shared(combined)
 			if unbatched:
 				hidden = hidden.squeeze(0)
-				value_ctx = value_ctx.squeeze(0)
-			return hidden, value_ctx
-		# No-attention path
-		hidden, intermediates = self._run_trunk(x)
-		value_ctx = torch.cat(
-			[x.detach()] + [a.detach() for a in intermediates], dim=-1)
-		return hidden, value_ctx
+			return hidden
+		return self.shared(x)
 
-	def value(self, h: Tensor | tuple) -> Tensor:
-		_, value_ctx = h
-		return self.value_head(value_ctx)
+	def policy_logits(self, h: Tensor) -> Tensor:
+		return self.policy_head(h)
 
-	def policy_logits(self, h: Tensor | tuple) -> Tensor:
-		hidden, _ = h
-		return self.policy_head(hidden)
+	@staticmethod
+	def state_value(logits: Tensor, mask: Tensor) -> Tensor:
+		"""State value = max predicted margin over legal actions.
+		Works for single [384] or batched [B, 384] inputs."""
+		return logits.masked_fill(~mask, float('-inf')).max(dim=-1).values
 
 class RandomBot:
 	"""Bot that plays uniformly random legal actions. For evaluation baseline.

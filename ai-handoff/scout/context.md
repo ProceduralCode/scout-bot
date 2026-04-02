@@ -1,6 +1,6 @@
 # Scout Bot Training
 
-Training a neural network bot for the card game Scout (3-5 players) using PPO self-play.
+Training a neural network bot for the card game Scout (3-5 players) via self-play. Q-network (value-based) approach, replacing PPO. Pipeline verified end-to-end through iteration 5.
 
 ## Diagnosis Before Treatment
 
@@ -20,51 +20,43 @@ Do not edit this section without asking the user.
 
 **The goal is a bot that learns strategy entirely through self-play from terminal outcomes (win/loss margin). No dense rewards, no heuristic opponents, no supervised bootstrapping.**
 
-The reasoning: if the network can't learn basic strategy (e.g., pairs beat singles) from self-play signal alone, adding scaffolding masks the problem rather than solving it. And if scaffolding is required to learn basics, there's no reason to believe the network will discover advanced strategies through self-play once that scaffolding is removed. The whole point is self-play working end-to-end.
-
 Do not edit this section without asking the user.
-
-**The legitimate question to ask instead:** Is this "the algorithm fundamentally can't learn" or "compute is insufficient at current scale"? These require different responses. Empirically check training curves before concluding the approach is broken — the signal may exist but be slow to accumulate.
 
 ## Architecture
 
-- **FlatScoutNetwork** (active) — Self-attention over 20 per-card entities → FC trunk (Linear → LayerNorm → GELU) → flat policy head (384 actions). Value head is a detached 2-layer MLP reading raw global metadata + all trunk layer activations (`.detach()`ed). Config via `PARAMS["attention"]` dict, preserved from checkpoint on resume (like `layer_sizes`).
-- **`forward()` returns a `(hidden, value_ctx)` tuple.** `value()` and `policy_logits()` unpack it.
-- **ScoutNetwork** — FC-only with sub-head action decomposition. Used by older eval checkpoints (v1-v4).
+- **FlatScoutNetwork** — Self-attention over 20 per-card entities → FC trunk (Linear → LayerNorm → GELU) → flat head (384 predicted margins). No value head — state value = max predicted margin over legal actions.
+- **`forward()` returns hidden tensor directly.** `policy_logits()` maps hidden → 384 outputs. `state_value(logits, mask)` is a static method for max-Q.
+- **ScoutNetwork** — FC-only with sub-head action decomposition and value head. Used by older eval checkpoints (v1-v4).
+
+## Q-Network Training Pipeline
+
+`train_q()` in main.py, invoked via `python main.py` (default mode). Config in `Q_PARAMS` dict.
+
+Per iteration: `play_games_q_v6` → `rollout_multi_action_v6` → `ReplayBuffer.add_cohort` → `prepare_q_batch_v6` (16x augmentation) → `q_update_v6` (masked MSE).
+
+- **Multi-action rollouts**: top-K + random extra actions per decision point. `action_taken` always included. Batched through GPU in chunks of 512 pairs × N rollouts. Immediate-end games (round over after action) compute margin directly.
+- **Rollout temperature**: `rollout_numba` accepts `temperature` param. 0.0 = greedy, 1.0 = softmax sampling from margin predictions.
+- **Action selection** (game play): softmax(temperature) + epsilon-greedy.
+- **Replay buffer**: cohort-based. Periodic revalidation re-rollouts a subset; weight = `max(0, 1 - mae / margin_max_diff)`. Dead cohorts removed.
+- **Augmentation**: on-the-fly via `FULL_PERM`/`HAND_SHIFT` permutation tables. All 16 rotations (including identity). No forward pass needed — just index permutations on state, target, and training mask tensors.
+- **Flip decisions**: max predicted margin over play actions [0..255] for each hand orientation.
 
 ## Encoding
 
-- **V6** (active): 16 circular hand slots, flat 384-action space, 309 dims (260 entity + 49 global metadata). Rotation augmentation (16x) via permutation tables (`FULL_PERM`, `HAND_SHIFT`).
-- **V2**: 15 hand slots, 261 dims. Used by eval checkpoints v1_4 through v4_2.
+- **V6** (active): 16 circular hand slots, flat 384-action space, 309 dims (260 entity + 49 global metadata). Rotation augmentation (16x) via permutation tables.
 - **Flat action space**: Play [0..255] = start_slot × 16 + end_slot. Scout [256..319]. S&S [320..383]. Play length = `(end_slot - start_slot) % 16 + 1` (must use modular arithmetic for circular wrapping).
 
-## Training Pipeline
+## GPU Engine & Rollouts
 
-Hybrid GAE + rollout mode via `rollout_fraction` PARAM. Rollout games provide ground-truth value targets; GAE games are cheaper. `gae_vloss_weight` controls GAE contribution to value loss (0.0 = value head trains on rollout data only). Setting `rollout_fraction=0.0` requires `gae_vloss_weight > 0` or the value head gets no gradient.
+`rollout_numba` in `numba_engine.py`: 4 Numba CUDA kernels + PyTorch network forward. Active-game compaction: forward pass only runs on non-done games each step (gather active indices → forward → scatter logits back). Numba kernels still process all B games (only 6% of step time). Forward pass chunked at 1024 samples (RTX 3060).
 
-**value_baseline PARAM**: `"learned"` (default) uses GAE with the value head. `"mean"` bypasses V(s) and uses `reward - batch_mean(reward)` as advantages (lines 907-920 of main.py). Only affects the GAE path.
+Pipeline: `from_snapshots` (gpu_engine.py) → `repeat_state` → `rollout_numba` → margin computation. `gpu_engine.py` is the reference/test oracle.
 
-**Adaptive LR**: `PARAMS["learning_rate"]` is the string `"adaptive"`. Each iteration, LR is nudged by 0.9x if KL > target, 1.1x if KL < target, clamped to `[lr_min, lr_max]`. `current_lr` is a mutable variable in the training loop, saved in checkpoints via `extra={"current_lr": ...}`. Set `learning_rate` to a float to disable adaptive mode and use fixed/linear-decay LR.
+Key design facts: hands are left-aligned (not circular), S&S is two steps via `state.phase`, `compute_legal_plays` returns hand-position space (not slot space).
 
-**Temperature scaling**: `sampling_temperature` divides logits during data collection. `old_log_prob` recorded at T=1 (the actual policy). NOT applied in rollout completions.
+## Rollout Performance Profile
 
-**KL early stopping**: `ppo_update_v6` breaks out of mini-batch loop when `approx_kl` exceeds `kl_target`. `kl_batch_frac` tracks fraction of mini-batches that actually run.
-
-**Reward modes**: `reward_mode` PARAM controls reward signal. `"game_score"` (default) uses margin. `"play_length"` gives `play_length/5.0` per step. `"play_and_scout"` blends both. Only affects GAE path — rollout advantages are always margin-based.
-
-**Explained variance** computed only over samples where `v_weight > 0`.
-
-**Ratio=1.0 invariant**: v6 path checks `first_batch_ratio` from first mini-batch of epoch 0.
-
-Rejected (do not remove): auxiliary CE loss / supervised hand-holding during PPO training.
-
-## Legal Play Statistics
-
-From `legal_play_stats.py` (10K random 3p games): singles legal 53.5% of turns, pairs 72.6%, triples 13.8%, quads 1.1%. When triples are legal: avg 1.1 triple options vs 4.4 singles, 3.3 pairs. Random uniform policy plays triples ~1.7% of the time.
-
-## Device Model
-
-**Training on CUDA, eval on CPU.** `_run_eval` moves network to CPU, restores in `finally`. Opponent pool and eval opponents stay on CPU. Never call `.item()` in a loop on GPU tensors.
+Per-step cost at B=15,300 (one chunk): forward pass 79%, sampling 8%, Numba kernels 10%, overhead 3%. Rollouts hit MAX_STEPS=100 every chunk; at step 100, ~11% of games still active (long scouting rounds with temperature=1.0 early in training). `chunk_pairs` parameter has negligible effect (benchmarked 256–16384+).
 
 ## Cython Acceleration
 
@@ -74,40 +66,17 @@ Two Cython modules with pure-Python fallbacks (import pattern at bottom of `enco
 
 Changes to encoding/masking logic must be updated in both `.py` and `.pyx`. Build: `pushd scout-bot && python setup.py build_ext --inplace; popd`.
 
-## Game Generation
-
-Four versions of turn logic — keep in sync when changing game mechanics:
-- `_play_turn()` / `_play_turn_v6()` — single-game (eval, rollout source)
-- `_process_turn_from_hidden()` — opponent path in `play_games_batched()`
-- Inline batched logic in `play_games_v6()` / `play_games_batched()` — training path
-- Inline batched logic in `rollout_from_states_batched_v6()` — rollout path
-
-## GPU Engine
-
-`rollout_numba` in `numba_engine.py`: 4 Numba CUDA kernels + PyTorch network forward. Forward pass chunked at 4096 samples (empirically optimal on RTX 3060 6.4GB — see `bench_batch_size.py`). Rollout pipeline: `from_snapshots` → `repeat_state` → `rollout_numba` → vectorized margin computation. `gpu_engine.py` is the reference/test oracle.
-
-Key design facts: hands are left-aligned (not circular), S&S is two steps via `state.phase`, `compute_legal_plays` returns hand-position space (not slot space).
-
 ## Training Setup
 
-Hyperparameters in `PARAMS` dict at top of `scout-bot/main.py` — edit directly, no CLI args. On resume, PARAMS overrides saved config except `layer_sizes`, `encoding_version`, and `attention`.
+**Device model**: Training on CUDA, eval on CPU. Never call `.item()` in a loop on GPU tensors.
 
-Scripts use `SCRIPT_DIR` pattern. `trunk_analysis.py` segfaults without `-u` flag on Windows.
-
-## Known Bug
-
-`_compute_diagnostics` in main.py (line 668) computes play length as `(a % 16) - (a // 16) + 1` — doesn't handle circular slot wrapping. Should use `(a % 16 - a // 16) % 16 + 1`. Affects chart diagnostic values `diag_policy_p_single/p_pair/p_3plus` only; does not affect training.
+Scripts use `SCRIPT_DIR` pattern. `trunk_analysis.py` segfaults without `-u` flag on Windows. Use `python -u` for unbuffered output when running training in background.
 
 ## Key File Locations
 
-- `scout-bot/main.py` — training loop, PARAMS, charts, adaptive LR, `_run_eval()`
-- `scout-bot/training.py` — game play, PPO update (`ppo_update_v6`), rollouts, GAE
-- `scout-bot/network.py` — FlatScoutNetwork (tuple-return forward, detached value head)
+- `scout-bot/main.py` — `Q_PARAMS`, `train_q()`, `_save_q_charts()` (4×4 grid), `_run_eval()` (has `chart_fn` param), PPO `train()` preserved
+- `scout-bot/training.py` — `QSample`, `ReplayBuffer`, `play_games_q_v6`, `rollout_multi_action_v6`, `prepare_q_batch_v6`, `q_update_v6`. Old PPO functions preserved as dead code.
+- `scout-bot/network.py` — FlatScoutNetwork, ScoutNetwork (v1-v4)
 - `scout-bot/encoding.py` — state encoding (v1-v6), mask functions, action decoding, permutation tables
 - `scout-bot/game.py` — game engine; cards are `(showing_value, hidden_value)` tuples
-- `scout-bot/numba_engine.py` — Numba CUDA rollout engine (chunked forward pass)
-- `scout-bot/bench_batch_size.py` — GPU forward pass throughput benchmark
-- `scout-bot/canonical_states.py` — hand-crafted game states, tests basic strategy
-- `scout-bot/kl_sensitivity_test.py` — KL divergence per optimizer step at various LRs
-- `scout-bot/legal_play_stats.py` — legal play availability by length (random games)
-- `scout-bot/triple_probe.py` — policy probability analysis for triples (loads checkpoint)
+- `scout-bot/numba_engine.py` — Numba CUDA rollout engine (active-game compaction, `temperature` param)

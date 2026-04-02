@@ -23,6 +23,8 @@ from training import (
 	prepare_ppo_batch, subsample_batch, concatenate_batches, ppo_update, direct_pg_update,
 	play_games_v6, play_games_with_rollouts_v6, prepare_ppo_batch_v6, subsample_batch_v6,
 	concatenate_batches_v6, ppo_update_v6, augment_rotation_v6,
+	play_games_q_v6, curate_samples, rollout_multi_action_v6, prepare_q_batch_v6, q_update_v6,
+	ReplayBuffer,
 )
 from game_log import GameLog
 from probe import eval_scout_quality
@@ -203,23 +205,62 @@ PARAMS = {
 # PARAMS["games_per_iteration"] = 1000
 # PARAMS["save_dir"] = "bots/v7_play_len_probe_6"
 
-# Temp probe test
-PARAMS["rollout_fraction"] = 0.0
-PARAMS["reward_mode"] = "play_length"
-PARAMS["gae_vloss_weight"] = 1.0
-PARAMS["gamma"] = 0.0
-PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
-PARAMS["value_loss_coeff"] = 0.0   # don't train value head
-PARAMS["entropy_bonus"] = 0.005
-PARAMS["sampling_temperature"] = 1.5
-PARAMS["entropy_foors"] = {
-	"play": 0.2,
-	"scout": 0.2,
+# # Temp probe test
+# PARAMS["rollout_fraction"] = 0.0
+# PARAMS["reward_mode"] = "play_length"
+# PARAMS["gae_vloss_weight"] = 1.0
+# PARAMS["gamma"] = 0.0
+# PARAMS["value_baseline"] = "mean"  # bypass learned V(s), use mean-centered rewards as advantages
+# PARAMS["value_loss_coeff"] = 0.0   # don't train value head
+# PARAMS["entropy_bonus"] = 0.005
+# PARAMS["sampling_temperature"] = 1.5
+# PARAMS["entropy_foors"] = {
+# 	"play": 0.2,
+# 	"scout": 0.2,
+# }
+# PARAMS["eval_opponents"] = {}
+# PARAMS["games_per_iteration"] = 300
+# PARAMS["rollouts_per_state"] = 50
+# PARAMS["save_dir"] = "bots/v7_play_len_probe_7"
+
+Q_PARAMS = {
+	"num_players": 4,
+	"layer_sizes": [256, 128],
+	"learning_rate": 0.0003,
+	"training_epochs": 3,
+	"mini_batch_size": 1024 * 16,
+	"game_count": 100,
+	"curation_multiplier": 10,
+	"temperature": 0.0,
+	"epsilon": 0.05,
+	"rollout_actions_per_sample": 10,
+	"rollout_actions_random_extra": 2,
+	"rollouts_per_action": 30,
+	"rollout_temperature": 1.0,
+	"augment_rotations": 16,
+	"cohort_check_interval": 5,
+	"replay_check_perc": 0.1,
+	"replay_margin_max_diff": 0.4,  # TODO: tune — max MAE before cohort is killed
+	"min_replay_perc": 0.3,
+	"log_interval": 1,
+	"eval_interval": 5,
+	"save_interval_hours": 3,
+	"attention": {"dim": 20, "heads": 4, "layers": 3},
+	"save_dir": "bots/v8_0",
+	"eval_opponents": {
+		"v1_4": "bots/v1_4/latest.pt",
+		"v2_5": "bots/v2_5/latest.pt",
+		"v3_4": "bots/v3_4/latest.pt",
+		"v4_2": "bots/v4_2/latest.pt",
+	},
+
+	# Unused
+	"training_seats": 4,
+	"opponent_pool_size": 10,
+	"snapshot_interval": 30,
+	"total_iterations": 1_000_000,
+	"encoding_version": 6,
 }
-PARAMS["eval_opponents"] = {}
-PARAMS["games_per_iteration"] = 300
-PARAMS["rollouts_per_state"] = 50
-PARAMS["save_dir"] = "bots/v7_play_len_probe_7"
 
 def _save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, filename, pool=None, extra=None):
 	path = os.path.join(save_dir, filename)
@@ -291,7 +332,7 @@ def _count_dormant_neurons(network, states, threshold=0.01):
 		h.remove()
 	return result
 
-def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir):
+def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir, chart_fn=None):
 	"""Run eval vs all opponents, update metrics, save charts."""
 	# Eval runs infrequently — move to CPU to avoid batch-1 GPU overhead
 	# and device mismatches in probe code that expects CPU tensors
@@ -328,7 +369,7 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 	finally:
 		if was_cuda:
 			network.cuda()
-	_save_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
+	(chart_fn or _save_charts)(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	if cfg.get("diagnose"):
 		_save_diagnostic_charts(metrics_history, save_dir)
 
@@ -702,6 +743,232 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 			lines.append(f"  {k}: {', '.join(vals)}")
 		lines.append("")
 
+	try:
+		with open(summary_path, "w") as f:
+			f.write("\n".join(lines))
+	except OSError as e:
+		print(f"  WARNING: failed to save summary: {e}")
+
+def _save_q_charts(metrics_history: dict, save_dir: str,
+				   eval_opponent_names: set[str] | None = None, cfg: dict | None = None):
+	"""Generate Q-network training charts PNG (4x4 grid)."""
+	iters = metrics_history["iteration"]
+	trim = 30 if len(iters) > 400 else 10 if len(iters) > 100 else 0
+	iters = iters[trim:]
+	all_eval_iters = metrics_history.get("eval_iteration", [])
+	eval_trim = sum(1 for ei in all_eval_iters if ei <= trim) if trim else 0
+	eval_iters = all_eval_iters[eval_trim:]
+	chart_path = os.path.join(save_dir, "charts.png")
+	all_iters = metrics_history["iteration"]
+	trimmed = {}
+	smoothed = {}
+	for k, vals in metrics_history.items():
+		if k in ("iteration", "eval_iteration") or k.startswith("_hist_") or not vals:
+			continue
+		if k.startswith("eval_") or k == "scout_play_len":
+			start = len(all_eval_iters) - len(vals)
+			t = max(eval_trim - start, 0)
+		else:
+			start = len(all_iters) - len(vals)
+			t = max(trim - start, 0)
+		trimmed[k] = vals[t:]
+		w = max(len(trimmed[k]) // 10, 3)
+		smoothed[k] = _smooth(trimmed[k], w) if len(trimmed[k]) >= w else trimmed[k]
+	BG = "#1a1a2e"
+	PANEL = "#16213e"
+	TEXT = "#e0e0e0"
+	SUBTEXT = "#a0a0a0"
+	GRID = "#ffffff"
+	with plt.style.context("dark_background"):
+		fig, axes = plt.subplots(4, 4, figsize=(18, 20))
+		fig.patch.set_facecolor(BG)
+		fig.suptitle("Scout Bot Q-Network Training", fontsize=16, color=TEXT, y=0.98)
+		def plot_line(ax, key, title, desc, color):
+			ax.set_facecolor(PANEL)
+			if key in trimmed:
+				ax.plot(iters[-len(trimmed[key]):], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
+				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2)
+			ax.set_title(title, color=TEXT, fontsize=11)
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
+					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			ax.tick_params(colors=SUBTEXT, labelsize=8)
+			ax.grid(True, alpha=0.15, color=GRID)
+		def plot_multi(ax, series, title, desc, ylim=None):
+			ax.set_facecolor(PANEL)
+			for key, label, color in series:
+				if key in trimmed:
+					ax.plot(iters[-len(smoothed[key]):], smoothed[key],
+							color=color, linewidth=1.5, label=label)
+			if ylim:
+				ax.set_ylim(*ylim)
+			if ax.get_legend_handles_labels()[1]:
+				ax.legend(fontsize=7, loc="upper right")
+			ax.set_title(title, color=TEXT, fontsize=11)
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
+					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			ax.tick_params(colors=SUBTEXT, labelsize=8)
+			ax.grid(True, alpha=0.15, color=GRID)
+		def _style_eval_ax(ax, title, desc):
+			ax.set_title(title, color=TEXT, fontsize=11)
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
+					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			ax.tick_params(colors=SUBTEXT, labelsize=8)
+			ax.grid(True, alpha=0.15, color=GRID)
+		def plot_hist_snapshot(ax, bins_key, counts_key, title, desc, color):
+			"""Plot a histogram snapshot as a line chart (x=bin centers, y=counts)."""
+			ax.set_facecolor(PANEL)
+			bins = metrics_history.get(bins_key)
+			counts = metrics_history.get(counts_key)
+			if bins and counts and len(bins) > 1:
+				centers = [(bins[i] + bins[i + 1]) / 2 for i in range(len(counts))]
+				ax.plot(centers, counts, color=color, linewidth=2)
+				ax.fill_between(centers, counts, alpha=0.15, color=color)
+			ax.set_title(title, color=TEXT, fontsize=11)
+			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
+					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			ax.tick_params(colors=SUBTEXT, labelsize=8)
+			ax.grid(True, alpha=0.15, color=GRID)
+		# Row 0: Primary metrics
+		ax_eval = axes[0, 0]
+		ax_eval.set_facecolor(PANEL)
+		opponent_colors = ["#b197fc", "#ff6b6b", "#69db7c", "#ffa552", "#5dadec"]
+		opponent_keys = sorted(k for k in smoothed if k.startswith("eval_margin_")
+			and (eval_opponent_names is None or k[len("eval_margin_"):] in eval_opponent_names))
+		for i, key in enumerate(opponent_keys):
+			name = key[len("eval_margin_"):]
+			c = opponent_colors[i % len(opponent_colors)]
+			ax_eval.plot(eval_iters[-len(trimmed[key]):], trimmed[key],
+						color=c, alpha=0.25, linewidth=0.8)
+			ax_eval.plot(eval_iters[-len(smoothed[key]):], smoothed[key],
+						color=c, linewidth=2, label=f"vs {name}")
+		ax_eval.axhline(y=0, color="#666666", linestyle="--", alpha=0.5)
+		if ax_eval.get_legend_handles_labels()[1]:
+			ax_eval.legend(fontsize=7, loc="upper left")
+		_style_eval_ax(ax_eval, "Score Margin",
+			"P0 score minus mean opponent. Positive = winning.")
+		plot_line(axes[0, 1], "mse_loss", "MSE Loss",
+			"Masked MSE between predicted and rollout margins. Primary training metric.", "#ff6b6b")
+		plot_multi(axes[0, 2], [
+			("mean_pred_margin", "Predicted", "#5dadec"),
+			("mean_target_margin", "Target", "#69db7c"),
+		], "Pred vs Target Margin",
+			"Mean predicted vs target margin for rolled actions. Gap = systematic bias.")
+		plot_line(axes[0, 3], "steps_per_game", "Steps Per Game",
+			"Average decisions per game. Shorter = more decisive play.", "#e0aaff")
+		# Row 1: Play behavior
+		plot_multi(axes[1, 0], [
+			("play_len_1_pct", "1", "#ff6b6b"),
+			("play_len_2_pct", "2", "#ffa552"),
+			("play_len_3_pct", "3", "#69db7c"),
+			("play_len_4_pct", "4", "#5dadec"),
+			("play_len_5_pct", "5", "#b197fc"),
+			("play_len_6_pct", "6", "#74c0fc"),
+			("play_len_7plus_pct", "7+", "#ffd43b"),
+		], "Play Length Distribution",
+			"Fraction of plays by length. Shift to longer = learning combos.")
+		plot_line(axes[1, 1], "avg_play_length", "Avg Play Length",
+			"Mean cards per play action.", "#69db7c")
+		ax_sq = axes[1, 2]
+		ax_sq.set_facecolor(PANEL)
+		if "scout_play_len" in trimmed:
+			ax_sq.plot(eval_iters[-len(trimmed["scout_play_len"]):], trimmed["scout_play_len"],
+					   color="#e0aaff", alpha=0.25, linewidth=0.8)
+			ax_sq.plot(eval_iters[-len(smoothed["scout_play_len"]):], smoothed["scout_play_len"],
+					   color="#e0aaff", linewidth=2)
+		_style_eval_ax(ax_sq, "Scout Play Length",
+			"Avg longest set/run containing scouted card. 1.0 = no play. Random ~1.5.")
+		plot_multi(axes[1, 3], [
+			("play_pct", "Play", "#69db7c"),
+			("scout_pct", "Scout", "#5dadec"),
+			("sns_pct", "S&S", "#ff6b6b"),
+		], "Action Type Distribution",
+			"Fraction of each action type.", ylim=(0, 1))
+		# Row 2: Network health
+		plot_multi(axes[2, 0], [
+			("entropy_play", "Play", "#5dadec"),
+			("entropy_scout", "Scout", "#ff6b6b"),
+		], "Conditional Entropies",
+			"Softmax entropy over margin predictions. Play/Scout regions separate. Low = converging.")
+		plot_multi(axes[2, 1], [
+			("dormant_neurons_layer_0", "Layer 0", "#ff6b6b"),
+			("dormant_neurons_layer_1", "Layer 1", "#ffa552"),
+			("dormant_neurons_layer_2", "Layer 2", "#69db7c"),
+			("dormant_neurons_total", "Total", "#e0aaff"),
+		], "Dormant Neurons",
+			"Neurons with mean |activation| < 0.01. High count = underutilized capacity.")
+		ax_rb = axes[2, 2]
+		ax_rb.set_facecolor(PANEL)
+		if "replay_alive_cohorts" in trimmed:
+			ax_rb.plot(iters[-len(smoothed["replay_alive_cohorts"]):],
+					   smoothed["replay_alive_cohorts"], color="#5dadec", linewidth=2, label="Cohorts")
+		ax_rb.set_ylabel("Cohorts", color="#5dadec", fontsize=8)
+		ax_rb.tick_params(axis="y", colors="#5dadec", labelsize=8)
+		ax_rb2 = ax_rb.twinx()
+		if "replay_total_samples" in trimmed:
+			ax_rb2.plot(iters[-len(smoothed["replay_total_samples"]):],
+						smoothed["replay_total_samples"], color="#69db7c", linewidth=2, label="Samples")
+		ax_rb2.set_ylabel("Total Samples", color="#69db7c", fontsize=8)
+		ax_rb2.tick_params(axis="y", colors="#69db7c", labelsize=8)
+		lines1, labels1 = ax_rb.get_legend_handles_labels()
+		lines2, labels2 = ax_rb2.get_legend_handles_labels()
+		if lines1 or lines2:
+			ax_rb.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
+		ax_rb.set_title("Replay Buffer", color=TEXT, fontsize=11)
+		ax_rb.text(0.5, -0.15, textwrap.fill(
+			"Alive cohorts and total replayable samples.", 45),
+			transform=ax_rb.transAxes, ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+		ax_rb.tick_params(axis="x", colors=SUBTEXT, labelsize=8)
+		ax_rb.grid(True, alpha=0.15, color=GRID)
+		plot_line(axes[2, 3], "lr", "Learning Rate",
+			"Current learning rate.", "#74c0fc")
+		# Row 3: Distribution snapshots (histograms as line charts, x=value not iteration)
+		plot_hist_snapshot(axes[3, 0], "_hist_margin_bins", "_hist_margin_counts",
+			"Margin Predictions", "Distribution of predicted margins (latest snapshot).", "#5dadec")
+		plot_hist_snapshot(axes[3, 1], "_hist_rollout_bins", "_hist_rollout_counts",
+			"Rollout Margins", "Distribution of rollout margins (latest snapshot).", "#69db7c")
+		plot_hist_snapshot(axes[3, 2], "_hist_age_bins", "_hist_age_counts",
+			"Replay Buffer Age", "Age distribution of replay samples (latest snapshot).", "#e0aaff")
+		axes[3, 3].set_visible(False)
+		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
+						   hspace=0.40, wspace=0.25)
+		try:
+			fig.savefig(chart_path, dpi=100, facecolor=fig.get_facecolor(),
+						bbox_inches='tight', pad_inches=0.15)
+		except OSError as e:
+			print(f"  WARNING: failed to save charts: {e}")
+		plt.close(fig)
+	# Write text summary with smoothed values
+	summary_path = os.path.join(save_dir, "summary.txt")
+	lines = [f"=== Q-Network Run: {len(iters)} iterations (trimmed first {trim}) ===\n"]
+	def _snap_idx(n):
+		count = min(n, 10)
+		step = (n - 1) / (count - 1) if count > 1 else 0
+		return [round(i * step) for i in range(count)]
+	idx = _snap_idx(len(iters))
+	lines.append("iters: " + ", ".join(str(iters[i]) for i in idx))
+	for k in smoothed:
+		if k.startswith("eval_"):
+			continue
+		kidx = idx if len(smoothed[k]) >= len(iters) else _snap_idx(len(smoothed[k]))
+		vals = [f"{smoothed[k][i]:.4f}" for i in kidx]
+		lines.append(f"  {k}: {', '.join(vals)}")
+	lines.append("")
+	eval_sm_keys = [k for k in smoothed if k.startswith("eval_")]
+	if eval_sm_keys:
+		lines.append("=== Eval ===\n")
+		eidx = _snap_idx(len(eval_iters))
+		lines.append("iters: " + ", ".join(str(eval_iters[i]) for i in eidx))
+		for k in eval_sm_keys:
+			kidx = eidx if len(smoothed[k]) >= len(eval_iters) else _snap_idx(len(smoothed[k]))
+			fmt = "+.2f" if "margin" in k else ".4f"
+			vals = [f"{smoothed[k][i]:{fmt}}" for i in kidx]
+			lines.append(f"  {k}: {', '.join(vals)}")
+		lines.append("")
+	if cfg:
+		lines.append("=== Config ===\n")
+		for k, v in sorted(cfg.items()):
+			lines.append(f"  {k}: {v}")
+		lines.append("")
 	try:
 		with open(summary_path, "w") as f:
 			f.write("\n".join(lines))
@@ -1312,6 +1579,289 @@ def train(config: dict | None = None, profile_iters: int | None = None):
 		_save_diagnostic_charts(metrics_history, save_dir)
 	print(f"Training complete. Saved to {save_dir}/latest.pt")
 
+def train_q(config: dict | None = None):
+	cfg = {**Q_PARAMS, **(config or {})}
+	save_dir = os.path.join(SCRIPT_DIR, cfg["save_dir"])
+	os.makedirs(save_dir, exist_ok=True)
+	network = FlatScoutNetwork(INPUT_SIZE_V6, cfg["layer_sizes"],
+		encoding_version=6, attention=cfg.get("attention"))
+	optimizer = torch.optim.Adam(network.parameters(), lr=cfg["learning_rate"])
+	replay_buffer = ReplayBuffer()
+	metrics_history = {
+		"iteration": [],
+		"mse_loss": [],
+		"mean_pred_margin": [], "mean_target_margin": [],
+		"entropy_play": [], "entropy_scout": [],
+		"play_pct": [], "scout_pct": [], "sns_pct": [],
+		"steps_per_game": [],
+		"avg_play_length": [],
+		"play_len_1_pct": [], "play_len_2_pct": [], "play_len_3_pct": [],
+		"play_len_4_pct": [], "play_len_5_pct": [], "play_len_6_pct": [],
+		"play_len_7plus_pct": [],
+		"eval_iteration": [],
+		"scout_play_len": [],
+		"replay_alive_cohorts": [], "replay_total_samples": [],
+		"dormant_neurons_total": [],
+		"dormant_neurons_layer_0": [], "dormant_neurons_layer_1": [],
+		"dormant_neurons_layer_2": [],
+		"lr": [],
+	}
+	start_iter = 1
+	# Auto-resume
+	resume_path = os.path.join(save_dir, "latest.pt")
+	if os.path.exists(resume_path):
+		checkpoint = torch.load(resume_path, weights_only=False, map_location='cpu')
+		network.load_state_dict(checkpoint["model_state"])
+		optimizer.load_state_dict(checkpoint["optimizer_state"])
+		start_iter = checkpoint["iteration"] + 1
+		if "metrics_history" in checkpoint:
+			for k, v in checkpoint["metrics_history"].items():
+				metrics_history[k] = v
+		saved_cfg = checkpoint.get("config", {})
+		cfg = {**saved_cfg, **Q_PARAMS, **(config or {})}
+		# Architecture params always come from checkpoint
+		for arch_key in ("layer_sizes", "encoding_version", "attention"):
+			if arch_key in saved_cfg:
+				cfg[arch_key] = saved_cfg[arch_key]
+		if "replay_buffer" in checkpoint:
+			replay_buffer.load_state_dict(checkpoint["replay_buffer"])
+		print(f"Resumed from iteration {start_iter - 1}")
+	pool = OpponentPool(max_size=cfg["opponent_pool_size"])
+	if os.path.exists(resume_path):
+		checkpoint = torch.load(resume_path, weights_only=False, map_location='cpu')
+		if "opponent_pool" in checkpoint:
+			pool.load_state_dicts(checkpoint["opponent_pool"], network)
+			print(f"  Restored opponent pool ({len(pool.versions)} versions)")
+	if not pool.versions:
+		pool.add(network)
+	# Load eval opponents
+	eval_opponents = {}
+	for name, path in cfg.get("eval_opponents", {}).items():
+		if path == "random":
+			eval_opponents[name] = RandomBot()
+		else:
+			ckpt = torch.load(os.path.join(SCRIPT_DIR, path), weights_only=False, map_location='cpu')
+			ckpt_cfg = ckpt.get("config", {})
+			ls = ckpt_cfg.get("layer_sizes", [
+				ckpt_cfg.get("first_hidden_size", 256), ckpt_cfg.get("hidden_size", 128)])
+			eval_ev = ckpt_cfg.get("encoding_version", 1)
+			if eval_ev == 6:
+				eval_net = FlatScoutNetwork(INPUT_SIZE_V6, ls,
+					encoding_version=6, attention=ckpt_cfg.get("attention"))
+			elif eval_ev == 2:
+				eval_net = ScoutNetwork(INPUT_SIZE_V2, ls,
+					play_start_size=PLAY_START_SIZE_V2, play_end_size=PLAY_END_SIZE_V2,
+					scout_insert_size=SCOUT_INSERT_SIZE_V2, encoding_version=2)
+			else:
+				eval_net = ScoutNetwork(layer_sizes=ls)
+			eval_net.load_state_dict(ckpt["model_state"])
+			eval_net.eval()
+			eval_opponents[name] = eval_net
+			print(f"  Loaded eval opponent '{name}' from {path} (v{eval_ev})")
+		key = f"eval_margin_{name}"
+		if key not in metrics_history:
+			metrics_history[key] = []
+	print(f"Q-network training: {cfg['num_players']} players, "
+		  f"layers={cfg['layer_sizes']}, attention={cfg.get('attention')}")
+	print(f"Games/iter={cfg['game_count']}, epochs={cfg['training_epochs']}, "
+		  f"rollout_actions={cfg['rollout_actions_per_sample']}+{cfg['rollout_actions_random_extra']}, "
+		  f"rollouts/action={cfg['rollouts_per_action']}")
+	print(f"Output: {save_dir}/")
+	if torch.cuda.is_available():
+		network.cuda()
+		for state in optimizer.state.values():
+			for k, v in state.items():
+				if isinstance(v, torch.Tensor):
+					state[k] = v.cuda()
+	# Pre-training eval
+	if start_iter <= 1:
+		_run_eval(network, eval_opponents, metrics_history, 0, cfg, save_dir,
+				  chart_fn=_save_q_charts)
+	last_snapshot_time = time.time()
+	iteration = start_iter
+	try:
+		for iteration in range(start_iter, cfg["total_iterations"] + 1):
+			t0 = time.time()
+			# Self-play: collect QSamples
+			network.eval()
+			opponents = pool.sample(cfg["num_players"] - cfg["training_seats"]) or None
+			cm = cfg["curation_multiplier"]
+			samples = play_games_q_v6(
+				network, cfg["game_count"] * cm, cfg["num_players"],
+				training_seats=cfg["training_seats"],
+				temperature=cfg["temperature"],
+				epsilon=cfg["epsilon"],
+				opponent_pool=opponents,
+			)
+			if cm > 1:
+				pool_size = len(samples)
+				samples = curate_samples(samples, cm)
+				print(f"  Curated {len(samples)} from {pool_size} samples")
+			play_time = time.time() - t0
+			# Multi-action rollout
+			t1 = time.time()
+			rollout_multi_action_v6(
+				samples, network, cfg["num_players"],
+				rollout_actions_per_sample=cfg["rollout_actions_per_sample"],
+				rollout_actions_random_extra=cfg["rollout_actions_random_extra"],
+				rollouts_per_action=cfg["rollouts_per_action"],
+				rollout_temperature=cfg["rollout_temperature"],
+			)
+			rollout_time = time.time() - t1
+			# Replay buffer management
+			replay_buffer.add_cohort(iteration, samples)
+			if iteration > 1:
+				replay_buffer.check_and_prune(
+					network, iteration,
+					cfg["cohort_check_interval"], cfg["replay_check_perc"],
+					cfg["rollouts_per_action"], cfg["num_players"],
+					cfg["replay_margin_max_diff"], cfg["min_replay_perc"],
+					rollout_temperature=cfg["rollout_temperature"],
+				)
+			all_samples = replay_buffer.sample_training_data(samples)
+			# Prepare batch with augmentation
+			states, targets, train_masks = prepare_q_batch_v6(
+				all_samples, cfg["augment_rotations"])
+			# Training epochs
+			t2 = time.time()
+			epoch_metrics = []
+			for epoch in range(cfg["training_epochs"]):
+				m = q_update_v6(network, optimizer, states, targets, train_masks,
+								cfg["mini_batch_size"])
+				epoch_metrics.append(m)
+			train_time = time.time() - t2
+			avg_metrics = {k: sum(em[k] for em in epoch_metrics) / len(epoch_metrics)
+						   for k in epoch_metrics[0]}
+			# Snapshot to opponent pool
+			if iteration % cfg["snapshot_interval"] == 0:
+				pool.add(network)
+			# Logging
+			if iteration % cfg["log_interval"] == 0:
+				n_steps = len(samples)
+				n_play = sum(1 for s in samples if s.action_taken < 256)
+				n_scout = sum(1 for s in samples if 256 <= s.action_taken < 320)
+				n_sns = sum(1 for s in samples if s.action_taken >= 320)
+				play_pct = n_play / max(n_steps, 1)
+				scout_pct = n_scout / max(n_steps, 1)
+				sns_pct = n_sns / max(n_steps, 1)
+				steps_per_game = n_steps / cfg["game_count"]
+				play_lengths = [s.play_length for s in samples if s.play_length is not None]
+				avg_play_length = sum(play_lengths) / max(len(play_lengths), 1)
+				n_plays = max(len(play_lengths), 1)
+				play_len_counts = [0] * 8
+				for l in play_lengths:
+					play_len_counts[min(l, 7)] += 1
+				play_len_pcts = [c / n_plays for c in play_len_counts]
+				rb_stats = replay_buffer.stats()
+				# Conditional entropies: entropy of softmax(margins) for play/scout regions
+				play_ents, scout_ents = [], []
+				for s in samples:
+					mask = s.action_mask.astype(bool)
+					out = torch.from_numpy(s.network_outputs)
+					play_legal = mask[:256]
+					if play_legal.sum() > 1:
+						p = torch.softmax(out[:256][play_legal], dim=0)
+						play_ents.append(-(p * p.log()).sum().item())
+					scout_legal = mask[256:]
+					if scout_legal.sum() > 1:
+						p = torch.softmax(out[256:][scout_legal], dim=0)
+						scout_ents.append(-(p * p.log()).sum().item())
+				avg_play_ent = sum(play_ents) / max(len(play_ents), 1)
+				avg_scout_ent = sum(scout_ents) / max(len(scout_ents), 1)
+				# Dormant neurons
+				dormant_info = _count_dormant_neurons(network, states)
+				# Histogram snapshots (latest only, overwritten each iter)
+				margin_outputs = []
+				for s in samples:
+					legal = s.action_mask.astype(bool)
+					margin_outputs.extend(s.network_outputs[legal].tolist())
+				if margin_outputs:
+					import numpy as _np
+					counts, edges = _np.histogram(margin_outputs, bins=40)
+					metrics_history["_hist_margin_bins"] = edges.tolist()
+					metrics_history["_hist_margin_counts"] = counts.tolist()
+				rollout_margins_all = []
+				for s in samples:
+					if s.rollout_margins:
+						rollout_margins_all.extend(s.rollout_margins)
+				if rollout_margins_all:
+					import numpy as _np
+					counts, edges = _np.histogram(rollout_margins_all, bins=40)
+					metrics_history["_hist_rollout_bins"] = edges.tolist()
+					metrics_history["_hist_rollout_counts"] = counts.tolist()
+				# Replay buffer age distribution
+				ages = []
+				for c in replay_buffer.get_alive_cohorts():
+					age = iteration - c["iteration"]
+					ages.extend([age] * len(c["samples"]))
+				if ages:
+					import numpy as _np
+					max_age = max(ages) + 1
+					bins = list(range(max_age + 1))
+					counts, edges = _np.histogram(ages, bins=bins)
+					metrics_history["_hist_age_bins"] = edges.tolist()
+					metrics_history["_hist_age_counts"] = counts.tolist()
+				# Store metrics
+				metrics_history["iteration"].append(iteration)
+				metrics_history["mse_loss"].append(avg_metrics["mse_loss"])
+				metrics_history["mean_pred_margin"].append(avg_metrics["mean_pred_margin"])
+				metrics_history["mean_target_margin"].append(avg_metrics["mean_target_margin"])
+				metrics_history["entropy_play"].append(avg_play_ent)
+				metrics_history["entropy_scout"].append(avg_scout_ent)
+				metrics_history["play_pct"].append(play_pct)
+				metrics_history["scout_pct"].append(scout_pct)
+				metrics_history["sns_pct"].append(sns_pct)
+				metrics_history["steps_per_game"].append(steps_per_game)
+				metrics_history["avg_play_length"].append(avg_play_length)
+				for i in range(1, 7):
+					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
+				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
+				metrics_history["replay_alive_cohorts"].append(rb_stats["alive_cohorts"])
+				metrics_history["replay_total_samples"].append(rb_stats["total_samples"])
+				if dormant_info:
+					metrics_history["dormant_neurons_total"].append(dormant_info["total"])
+					for li in range(3):
+						metrics_history[f"dormant_neurons_layer_{li}"].append(
+							dormant_info.get(f"layer_{li}", 0))
+				metrics_history["lr"].append(cfg["learning_rate"])
+				print(f"[iter {iteration:>5}] "
+					  f"mse={avg_metrics['mse_loss']:.4f}  "
+					  f"pred={avg_metrics['mean_pred_margin']:+.3f}  "
+					  f"targ={avg_metrics['mean_target_margin']:+.3f}  "
+					  f"ent_p={avg_play_ent:.2f} ent_s={avg_scout_ent:.2f}  "
+					  f"steps={n_steps}  "
+					  f"buf={rb_stats['alive_cohorts']}c/{rb_stats['total_samples']}s  "
+					  f"pool={len(pool.versions)}  "
+					  f"play={play_time:.1f}s  ro={rollout_time:.1f}s  train={train_time:.1f}s")
+				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
+								save_dir, "latest.pt", pool=pool,
+								extra={"replay_buffer": replay_buffer.state_dict()})
+			# Periodic snapshots
+			now = time.time()
+			save_hours = cfg.get("save_interval_hours")
+			save_snapshot = False
+			if save_hours is not None:
+				save_snapshot = (now - last_snapshot_time) >= save_hours * 3600
+			elif iteration % cfg.get("save_interval", 1000) == 0:
+				save_snapshot = True
+			if save_snapshot:
+				last_snapshot_time = now
+				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
+								save_dir, f"iter_{iteration}.pt",
+								extra={"replay_buffer": replay_buffer.state_dict()})
+				print(f"  Saved snapshot (iter {iteration})")
+			# Eval
+			if iteration % cfg["eval_interval"] == 0:
+				_run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir,
+						  chart_fn=_save_q_charts)
+	except KeyboardInterrupt:
+		print(f"\nInterrupted at iteration {iteration}.")
+	# Final save
+	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt",
+					pool=pool, extra={"replay_buffer": replay_buffer.state_dict()})
+	_save_q_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
+	print(f"Training complete. Saved to {save_dir}/latest.pt")
+
 def main():
 	parser = argparse.ArgumentParser(description="Train a Scout card game bot")
 	parser.add_argument("--players", type=int, default=None, choices=[3, 4, 5])
@@ -1324,6 +1874,8 @@ def main():
 		help="Number of games for --match (default: 100)")
 	parser.add_argument("--profile", type=int, default=None, metavar="N",
 		help="Profile N training iterations with pyinstrument, then exit")
+	parser.add_argument("--mode", type=str, default="q", choices=["ppo", "q"],
+		help="Training mode: 'q' (Q-network, default) or 'ppo'")
 	args = parser.parse_args()
 	if args.replay:
 		from game_log import GameLog, print_replay
@@ -1339,12 +1891,14 @@ def main():
 			return
 		run_matchup(agents, args.games)
 		return
-	config = {
+	config = {k: v for k, v in {
 		"num_players": args.players,
 		"save_dir": args.save_dir,
-	}
-	train({k: v for k, v in config.items() if v is not None},
-		  profile_iters=args.profile)
+	}.items() if v is not None}
+	if args.mode == "q":
+		train_q(config)
+	else:
+		train(config, profile_iters=args.profile)
 
 if __name__ == "__main__":
 	main()

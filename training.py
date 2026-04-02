@@ -67,6 +67,185 @@ class StepRecordV6:
 	scout_quality: int | None
 	predicted_value: float = 0.0  # network prediction before rollout overwrite
 
+@dataclass
+class QSample:
+	"""One decision point for Q-network training with multi-action rollouts."""
+	state: torch.Tensor         # [INPUT_SIZE_V6]
+	action_mask: np.ndarray     # bool [384], all legal actions
+	action_taken: int           # flat action index used in actual game play
+	network_outputs: np.ndarray # [384], network predictions at collection time
+	hand_offset: int
+	player: int
+	game_id: int
+	play_length: int | None
+	scout_quality: int | None
+	snapshot: Game              # game state clone for revalidation rollouts
+	# Filled in after rollout phase
+	rolled_actions: list[int] | None = None
+	rollout_margins: list[float] | None = None
+	rollout_stds: list[float] | None = None
+
+class ReplayBuffer:
+	"""Cohort-based replay buffer with periodic revalidation.
+	Each cohort is one iteration's worth of training samples."""
+
+	def __init__(self):
+		self.cohorts: list[dict] = []
+
+	def add_cohort(self, iteration: int, samples: list[QSample]):
+		self.cohorts.append({
+			"iteration": iteration,
+			"samples": samples,
+			"alive": True,
+			"weight": 1.0,
+			"last_validated": None,
+		})
+
+	def get_alive_cohorts(self) -> list[dict]:
+		return [c for c in self.cohorts if c["alive"]]
+
+	def sample_training_data(self, fresh_samples: list[QSample]) -> list[QSample]:
+		"""Combine fresh samples with weighted replay from alive cohorts."""
+		result = list(fresh_samples)
+		for cohort in self.cohorts:
+			if not cohort["alive"]:
+				continue
+			# Skip the freshest cohort (it IS the fresh_samples)
+			if cohort is self.cohorts[-1]:
+				continue
+			n_take = max(1, int(cohort["weight"] * len(cohort["samples"])))
+			if n_take >= len(cohort["samples"]):
+				result.extend(cohort["samples"])
+			else:
+				result.extend(random.sample(cohort["samples"], n_take))
+		return result
+
+	def revalidate(self, network, cohort: dict, check_perc: float,
+				   rollouts_per_action: int, num_players: int,
+				   margin_max_diff: float, min_replay_perc: float,
+				   rollout_temperature: float = 1.0):
+		"""Re-rollout a subset of cohort samples with current network.
+		Updates cohort weight based on margin discrepancy. Marks dead if below threshold."""
+		samples = cohort["samples"]
+		n_check = max(1, int(check_perc * len(samples)))
+		check_samples = random.sample(samples, n_check)
+		# Re-rollout to get current margins (imported at call time to avoid circular deps)
+		from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state, compute_scores_tensor
+		from numba_engine import rollout_numba
+		total_mae = 0.0
+		n_compared = 0
+		for sample in check_samples:
+			if sample.rolled_actions is None:
+				continue
+			# Pick a subset of rolled actions to re-check
+			for i, action_idx in enumerate(sample.rolled_actions):
+				g = sample.snapshot.clone()
+				action = decode_flat_action(action_idx, sample.hand_offset)
+				_apply_action_to_game(g, action)
+				gpu_state = gpu_from_snapshots([g], device='cuda')
+				gpu_state = repeat_state(gpu_state, rollouts_per_action)
+				scores_t = rollout_numba(gpu_state, network,
+										 temperature=rollout_temperature)
+				sf = scores_t[:, :num_players].float()
+				total = sf.sum(dim=1, keepdim=True)
+				margins = (sf * num_players - total) / ((num_players - 1) * 10.0)
+				new_margin = margins[:, sample.player].mean().item()
+				old_margin = sample.rollout_margins[i]
+				total_mae += abs(new_margin - old_margin)
+				n_compared += 1
+		if n_compared == 0:
+			return
+		mae = total_mae / n_compared
+		# Linear fade: weight = max(0, 1 - mae / max_diff)
+		cohort["weight"] = max(0.0, 1.0 - mae / margin_max_diff)
+		cohort["last_validated"] = {"mae": mae, "n_compared": n_compared}
+		# Kill cohort if effective sample count too low
+		effective_pct = cohort["weight"]
+		if effective_pct < min_replay_perc:
+			cohort["alive"] = False
+
+	def check_and_prune(self, network, current_iteration: int,
+						cohort_check_interval: int, check_perc: float,
+						rollouts_per_action: int, num_players: int,
+						margin_max_diff: float, min_replay_perc: float,
+						rollout_temperature: float = 1.0):
+		"""Revalidate cohorts that are due and remove dead ones."""
+		for cohort in self.get_alive_cohorts():
+			# Skip the freshest cohort
+			if cohort is self.cohorts[-1]:
+				continue
+			age = current_iteration - cohort["iteration"]
+			if age > 0 and age % cohort_check_interval == 0:
+				self.revalidate(network, cohort, check_perc,
+								rollouts_per_action, num_players,
+								margin_max_diff, min_replay_perc,
+								rollout_temperature=rollout_temperature)
+		# Remove dead cohorts entirely
+		self.cohorts = [c for c in self.cohorts if c["alive"]]
+
+	def stats(self) -> dict:
+		"""Summary stats for logging."""
+		alive = self.get_alive_cohorts()
+		return {
+			"alive_cohorts": len(alive),
+			"total_samples": sum(len(c["samples"]) for c in alive),
+			"weights": [c["weight"] for c in alive],
+		}
+
+	def state_dict(self) -> dict:
+		"""Serialize for checkpointing."""
+		cohorts_data = []
+		for c in self.cohorts:
+			samples_data = []
+			for s in c["samples"]:
+				samples_data.append({
+					"state": s.state,
+					"action_mask": s.action_mask,
+					"action_taken": s.action_taken,
+					"network_outputs": s.network_outputs,
+					"hand_offset": s.hand_offset,
+					"player": s.player,
+					"game_id": s.game_id,
+					"play_length": s.play_length,
+					"scout_quality": s.scout_quality,
+					"snapshot": s.snapshot,
+					"rolled_actions": s.rolled_actions,
+					"rollout_margins": s.rollout_margins,
+					"rollout_stds": s.rollout_stds,
+				})
+			cohorts_data.append({
+				"iteration": c["iteration"],
+				"samples": samples_data,
+				"alive": c["alive"],
+				"weight": c["weight"],
+				"last_validated": c["last_validated"],
+			})
+		return {"cohorts": cohorts_data}
+
+	def load_state_dict(self, state: dict):
+		"""Restore from checkpoint."""
+		self.cohorts = []
+		for cd in state["cohorts"]:
+			samples = []
+			for sd in cd["samples"]:
+				samples.append(QSample(**sd))
+			self.cohorts.append({
+				"iteration": cd["iteration"],
+				"samples": samples,
+				"alive": cd["alive"],
+				"weight": cd["weight"],
+				"last_validated": cd["last_validated"],
+			})
+
+def _apply_action_to_game(game: Game, action: dict):
+	"""Apply a decoded action dict to a game. Used by rollout and revalidation."""
+	if action['type'] == 'play':
+		game.apply_play(action['start'], action['end'])
+	elif action['type'] == 'scout':
+		game.apply_scout(action['left_end'], action['flip'], action['insert_pos'])
+	elif action['type'] == 'sns':
+		game.apply_sns_scout(action['left_end'], action['flip'], action['insert_pos'])
+
 def _assign_round_rewards(round_records: list[StepRecord], game: Game,
 						  round_idx: int, reward_mode: str = "game_score",
 						  reward_distribution: str = "terminal",
@@ -453,8 +632,15 @@ def _play_round(game: Game, networks: list[ScoutNetwork],
 			_dev = next(net.parameters()).device
 			h_normal = net(t_normal.to(_dev))
 			h_flipped = net(t_flipped.to(_dev))
-			v_normal = net.value(h_normal).item()
-			v_flipped = net.value(h_flipped).item()
+			if ev == 6:
+				# No value head — use max predicted margin over play actions
+				logits_n = net.policy_logits(h_normal)
+				logits_f = net.policy_logits(h_flipped)
+				v_normal = logits_n[:256].max().item()
+				v_flipped = logits_f[:256].max().item()
+			else:
+				v_normal = net.value(h_normal).item()
+				v_flipped = net.value(h_flipped).item()
 		did_flip = v_flipped > v_normal
 		game.submit_flip_decision(p, do_flip=did_flip)
 		if game_log:
@@ -1533,8 +1719,8 @@ def _play_turn_v6(game: Game, networks: list, game_log=None) -> list[StepRecordV
 		forced_play = game.phase == Phase.SNS_PLAY
 		state = encode_state_v6(game, p, hand_offset, forced_play=forced_play)
 		hidden = net(state.to(dev))
-		value = net.value(hidden).item()
 		logits = net.policy_logits(hidden)
+		value = net.value(hidden).item() if hasattr(net, 'value') else 0.0
 		mask_t = get_flat_action_mask(game, p, legal_plays, hand_offset).to(dev)
 		if not mask_t.any():
 			game._advance_turn()
@@ -2343,3 +2529,393 @@ def augment_rotation_v6(steps: list[StepRecordV6], advantages: list[float],
 					all_vw.append(v_weights[i])
 
 	return all_steps, all_advs, all_vw
+
+# ============================================================
+# Q-network training functions
+# ============================================================
+
+def _select_action_q(logits: torch.Tensor, mask: torch.Tensor,
+					 temperature: float, epsilon: float) -> int:
+	"""Select action via softmax(temperature) + epsilon-greedy.
+	temperature=0 → greedy, epsilon=0 → no random exploration."""
+	if epsilon > 0 and random.random() < epsilon:
+		legal = mask.nonzero(as_tuple=True)[0]
+		return legal[random.randint(0, len(legal) - 1)].item()
+	if temperature == 0:
+		return logits.masked_fill(~mask, float('-inf')).argmax().item()
+	scaled = logits / temperature
+	scaled = scaled.masked_fill(~mask, float('-inf'))
+	probs = torch.softmax(scaled, dim=-1)
+	return torch.multinomial(probs, 1).item()
+
+def _select_action_q_batched(logits: torch.Tensor, masks: torch.Tensor,
+							 temperature: float, epsilon: float) -> torch.Tensor:
+	"""Batched action selection. Returns [B] LongTensor."""
+	B = logits.shape[0]
+	if temperature == 0 and epsilon == 0:
+		return logits.masked_fill(~masks, float('-inf')).argmax(dim=1)
+	# Start with greedy/softmax selection
+	if temperature == 0:
+		actions = logits.masked_fill(~masks, float('-inf')).argmax(dim=1)
+	else:
+		scaled = logits / temperature
+		scaled = scaled.masked_fill(~masks, float('-inf'))
+		probs = torch.softmax(scaled, dim=-1)
+		actions = torch.multinomial(probs, 1).squeeze(1)
+	# Apply epsilon: replace some actions with random legal ones
+	if epsilon > 0:
+		eps_mask = torch.rand(B, device=logits.device) < epsilon
+		if eps_mask.any():
+			# Random legal action for epsilon slots
+			legal_counts = masks.sum(dim=1).long()
+			rand_indices = (torch.rand(B, device=logits.device) * legal_counts.float()).long()
+			cumsum = masks.cumsum(dim=1)
+			# For each epsilon slot, find the rand_indices-th legal action
+			for bi in eps_mask.nonzero(as_tuple=True)[0]:
+				legal = masks[bi].nonzero(as_tuple=True)[0]
+				actions[bi] = legal[rand_indices[bi] % len(legal)]
+	return actions
+
+def play_games_q_v6(network, game_count: int, num_players: int,
+					training_seats: int = 4, temperature: float = 0.0,
+					epsilon: float = 0.0, opponent_pool: list | None = None,
+					) -> list[QSample]:
+	"""Play games and collect QSamples with game snapshots for Q-network training.
+	Action selection: softmax(temperature) + epsilon-greedy.
+	Returns QSamples without rollout data (filled in later by rollout_multi_action_v6)."""
+	H = HAND_SLOTS_V6
+	all_samples: list[QSample] = []
+	network.eval()
+	dev = next(network.parameters()).device
+	with torch.no_grad():
+		games = [Game(num_players) for _ in range(game_count)]
+		game_networks = []
+		for g_idx in range(game_count):
+			games[g_idx].starting_player = random.randint(0, num_players - 1)
+			games[g_idx].total_rounds = 1
+			nets = []
+			for seat in range(num_players):
+				if seat < training_seats:
+					nets.append(network)
+				elif opponent_pool:
+					nets.append(random.choice(opponent_pool))
+				else:
+					nets.append(network)
+			game_networks.append(nets)
+		game_samples = [[] for _ in range(game_count)]
+		for g in games:
+			g.start_round()
+		# === Flip phase (batched for training network) ===
+		flip_info = []
+		flip_normals = []
+		flip_flipped = []
+		for g_idx, g in enumerate(games):
+			for p in range(num_players):
+				if game_networks[g_idx][p] is network:
+					ho = random.randint(0, H - 1)
+					t_n, t_f = encode_hand_both_orientations_v6(g, p, ho)
+					flip_info.append((g_idx, p))
+					flip_normals.append(t_n)
+					flip_flipped.append(t_f)
+		if flip_normals:
+			normals_batch = torch.stack(flip_normals).to(dev)
+			flipped_batch = torch.stack(flip_flipped).to(dev)
+			h_n = network(normals_batch)
+			h_f = network(flipped_batch)
+			logits_n = network.policy_logits(h_n)
+			logits_f = network.policy_logits(h_f)
+			# Max predicted margin over play actions (no scouts at round start)
+			v_n = logits_n[:, :256].max(dim=1).values
+			v_f = logits_f[:, :256].max(dim=1).values
+			for i, (g_idx, p) in enumerate(flip_info):
+				games[g_idx].submit_flip_decision(p, do_flip=v_f[i].item() > v_n[i].item())
+		# Opponent flips (unbatched)
+		for g_idx, g in enumerate(games):
+			for p in range(num_players):
+				net = game_networks[g_idx][p]
+				if net is not network:
+					ho = random.randint(0, H - 1)
+					t_n, t_f = encode_hand_both_orientations_v6(g, p, ho)
+					h_n = net(t_n)
+					h_f = net(t_f)
+					logits_n = net.policy_logits(h_n)
+					logits_f = net.policy_logits(h_f)
+					v_n = logits_n[:256].max().item()
+					v_f = logits_f[:256].max().item()
+					g.submit_flip_decision(p, do_flip=v_f > v_n)
+		# === Turn phase (batched) ===
+		while any(g.phase in (Phase.TURN, Phase.SNS_PLAY) for g in games):
+			train_pending = []
+			opp_pending = []
+			for g_idx, g in enumerate(games):
+				if g.phase not in (Phase.TURN, Phase.SNS_PLAY):
+					continue
+				p = g.current_player
+				net = game_networks[g_idx][p]
+				hand = g.players[p].hand
+				legal_plays = get_legal_plays(hand, g.current_play)
+				ho = random.randint(0, H - 1)
+				forced_play = g.phase == Phase.SNS_PLAY
+				state = encode_state_v6(g, p, ho, forced_play=forced_play)
+				mask_t = get_flat_action_mask(g, p, legal_plays, ho)
+				entry = (g_idx, p, ho, state, mask_t, hand)
+				if net is network:
+					train_pending.append(entry)
+				else:
+					opp_pending.append((entry, net))
+			if not train_pending and not opp_pending:
+				break
+			# Batched forward pass for training network
+			if train_pending:
+				states_batch = torch.stack([e[3] for e in train_pending]).to(dev)
+				masks_batch = torch.stack([e[4] for e in train_pending]).to(dev)
+				hidden = network(states_batch)
+				logits = network.policy_logits(hidden)
+				has_action = masks_batch.any(dim=1)
+				actions_batch = _select_action_q_batched(
+					logits, masks_batch, temperature, epsilon)
+				# CPU bulk transfer
+				has_action_cpu = has_action.tolist()
+				actions_cpu = actions_batch.tolist()
+				logits_cpu = logits.cpu().numpy()
+				for i, (g_idx, p, ho, state, mask_t, hand) in enumerate(train_pending):
+					g = games[g_idx]
+					if not has_action_cpu[i]:
+						g._advance_turn()
+						continue
+					action_idx = actions_cpu[i]
+					action = decode_flat_action(action_idx, ho)
+					# Record QSample for training seats
+					if p < training_seats:
+						play_length = None
+						scout_quality = None
+						if action['type'] == 'play':
+							play_length = action['end'] - action['start'] + 1
+						elif action['type'] in ('scout', 'sns'):
+							left_end, flip = action['left_end'], action['flip']
+							insert_pos = action['insert_pos']
+							play_cards = g.current_play.cards
+							scouted = play_cards[0] if left_end else play_cards[-1]
+							if flip:
+								scouted = (scouted[1], scouted[0])
+							new_hand = list(hand[:insert_pos]) + [scouted] + list(hand[insert_pos:])
+							max_len = 1
+							for s, e in get_legal_plays(new_hand, None):
+								if s <= insert_pos <= e:
+									max_len = max(max_len, e - s + 1)
+							scout_quality = max_len
+						sample = QSample(
+							state=state,
+							action_mask=mask_t.numpy(),
+							action_taken=action_idx,
+							network_outputs=logits_cpu[i].copy(),
+							hand_offset=ho,
+							player=p,
+							game_id=g_idx,
+							play_length=play_length,
+							scout_quality=scout_quality,
+							snapshot=g.clone(),
+						)
+						game_samples[g_idx].append(sample)
+					_apply_action_to_game(g, action)
+			# Opponent forward passes (unbatched)
+			for (g_idx, p, ho, state, mask_t, hand), net in opp_pending:
+				g = games[g_idx]
+				if not mask_t.any():
+					g._advance_turn()
+					continue
+				hidden = net(state)
+				logits = net.policy_logits(hidden)
+				action_idx, _ = masked_sample(logits, mask_t)
+				action = decode_flat_action(action_idx, ho)
+				_apply_action_to_game(g, action)
+		# Flatten all samples
+		for g_idx, g in enumerate(games):
+			all_samples.extend(game_samples[g_idx])
+	return all_samples
+
+def curate_samples(samples: list[QSample], multiplier: int) -> list[QSample]:
+	"""Subsample from a larger pool, weighting toward samples with rare legal actions.
+	Equalizes per-output-neuron training signal across the 384 action space."""
+	from encoding import FULL_PERM, HAND_SLOTS_V6
+	H = HAND_SLOTS_V6
+	target = len(samples) // multiplier
+	if target >= len(samples):
+		return samples
+	n = len(samples)
+	# Build [n, 384] mask matrix and [16, 384] permutation table
+	masks = np.stack([s.action_mask.astype(np.float64) for s in samples])  # [n, 384]
+	perms = np.stack([FULL_PERM[(H - k) % H].numpy() for k in range(H)])  # [16, 384]
+	# Count per-output legal frequency across all rotations
+	# For each rotation, permute every sample's mask and accumulate
+	freq = np.zeros(FLAT_ACTION_SIZE, dtype=np.float64)
+	for k in range(H):
+		freq += masks[:, perms[k]].sum(axis=0)
+	freq = np.maximum(freq, 1.0)
+	inv_freq = 1.0 / freq
+	# Score each sample: mean inverse frequency of its legal actions (across rotations)
+	# Sum inv_freq values at each sample's permuted legal positions
+	scores = np.zeros(n)
+	for k in range(H):
+		scores += (masks[:, perms[k]] * inv_freq).sum(axis=1)
+	legal_counts = masks.sum(axis=1) * H  # total (action, rotation) pairs per sample
+	scores /= np.maximum(legal_counts, 1.0)
+	# Weighted sampling without replacement
+	probs = scores / scores.sum()
+	chosen = np.random.choice(n, size=target, replace=False, p=probs)
+	return [samples[i] for i in chosen]
+
+def rollout_multi_action_v6(samples: list[QSample], network, num_players: int,
+							rollout_actions_per_sample: int = 10,
+							rollout_actions_random_extra: int = 2,
+							rollouts_per_action: int = 30,
+							rollout_temperature: float = 1.0,
+							chunk_pairs: int = 512):
+	"""Select top-K + random actions per sample, batch GPU rollout, fill margins/stds.
+	Modifies samples in-place (rolled_actions, rollout_margins, rollout_stds)."""
+	from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
+	from numba_engine import rollout_numba
+
+	# Step 1: Select which actions to roll out for each sample
+	for sample in samples:
+		legal = np.where(sample.action_mask)[0]
+		outputs = sample.network_outputs[legal]
+		k = min(rollout_actions_per_sample, len(legal))
+		top_idx = legal[np.argsort(outputs)[-k:][::-1]]
+		selected = set(top_idx.tolist())
+		selected.add(sample.action_taken)
+		remaining = [a for a in legal if a not in selected]
+		n_extra = min(rollout_actions_random_extra, len(remaining))
+		if n_extra > 0:
+			selected.update(random.sample(remaining, n_extra))
+		sample.rolled_actions = sorted(selected)
+
+	# Step 2: Collect all (sample_idx, action_position, action_idx) pairs
+	pairs = []
+	for si, sample in enumerate(samples):
+		for ai, action_idx in enumerate(sample.rolled_actions):
+			pairs.append((si, ai, action_idx))
+
+	# Step 3: Process in chunks through GPU rollout pipeline
+	margins_buf = {}  # (si, ai) → (mean_margin, std_margin)
+	for chunk_start in range(0, len(pairs), chunk_pairs):
+		chunk = pairs[chunk_start:chunk_start + chunk_pairs]
+		# Clone snapshots, apply candidate actions, separate done vs needs-rollout
+		games = []
+		rollout_info = []  # (game_index_in_batch, si, ai)
+		for si, ai, action_idx in chunk:
+			sample = samples[si]
+			g = sample.snapshot.clone()
+			action = decode_flat_action(action_idx, sample.hand_offset)
+			_apply_action_to_game(g, action)
+			if g.phase in (Phase.ROUND_OVER, Phase.GAME_OVER):
+				# Game ended immediately — compute margin from final scores
+				scores = g.cumulative_scores[:num_players]
+				ps = scores[sample.player]
+				total = sum(scores)
+				margin = (ps * num_players - total) / ((num_players - 1) * 10.0)
+				margins_buf[(si, ai)] = (margin, 0.0)
+			else:
+				rollout_info.append((len(games), si, ai))
+				games.append(g)
+		if not games:
+			continue
+		# Batch GPU rollout
+		gpu_state = gpu_from_snapshots(games, device='cuda')
+		gpu_state = repeat_state(gpu_state, rollouts_per_action)
+		scores_t = rollout_numba(gpu_state, network, temperature=rollout_temperature)
+		# Compute per-player margins: (player_score * N - total) / ((N-1) * 10)
+		sf = scores_t[:, :num_players].float()
+		total = sf.sum(dim=1, keepdim=True)
+		all_margins = (sf * num_players - total) / ((num_players - 1) * 10.0)
+		all_margins = all_margins.view(len(games), rollouts_per_action, num_players)
+		for gi, si, ai in rollout_info:
+			m = all_margins[gi, :, samples[si].player]
+			margins_buf[(si, ai)] = (m.mean().item(), m.std().item())
+
+	# Step 4: Write back to samples
+	for si, sample in enumerate(samples):
+		sample.rollout_margins = []
+		sample.rollout_stds = []
+		for ai in range(len(sample.rolled_actions)):
+			mean_m, std_m = margins_buf[(si, ai)]
+			sample.rollout_margins.append(mean_m)
+			sample.rollout_stds.append(std_m)
+
+def prepare_q_batch_v6(samples: list[QSample],
+					   augment_rotations: int = 16,
+					   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Build training tensors with on-the-fly rotation augmentation.
+	Returns (states, targets, training_masks) all on CPU."""
+	from encoding import FULL_PERM, HAND_SHIFT, HAND_SLOTS_V6
+	H = HAND_SLOTS_V6
+
+	# Filter to samples with rollout data
+	valid = [s for s in samples if s.rolled_actions is not None]
+	if not valid:
+		return torch.empty(0, 309), torch.empty(0, 384), torch.empty(0, 384)
+
+	n = len(valid)
+	# Build original state/target/mask tensors
+	orig_states = torch.stack([s.state for s in valid])  # [n, 309]
+	orig_targets = torch.zeros(n, FLAT_ACTION_SIZE)
+	orig_masks = torch.zeros(n, FLAT_ACTION_SIZE)
+	for i, s in enumerate(valid):
+		for ai, action_idx in enumerate(s.rolled_actions):
+			orig_targets[i, action_idx] = s.rollout_margins[ai]
+			orig_masks[i, action_idx] = 1.0
+
+	# Apply all rotations (k=0 is identity)
+	all_states = []
+	all_targets = []
+	all_masks = []
+	for k in range(augment_rotations):
+		shift = HAND_SHIFT[k]
+		inv_perm = FULL_PERM[(H - k) % H]
+		all_states.append(orig_states[:, shift])
+		all_targets.append(orig_targets[:, inv_perm])
+		all_masks.append(orig_masks[:, inv_perm])
+
+	return (torch.cat(all_states), torch.cat(all_targets), torch.cat(all_masks))
+
+def q_update_v6(network, optimizer: torch.optim.Optimizer,
+				states: torch.Tensor, targets: torch.Tensor,
+				training_masks: torch.Tensor,
+				mini_batch_size: int, max_grad_norm: float = 0.5,
+				) -> dict:
+	"""One pass of masked MSE training over shuffled mini-batches.
+	Returns metrics dict."""
+	network.train()
+	dev = next(network.parameters()).device
+	n = states.shape[0]
+	indices = torch.randperm(n)
+	total_loss = 0.0
+	total_pred = 0.0
+	total_target = 0.0
+	n_batches = 0
+	for start in range(0, n, mini_batch_size):
+		mb_idx = indices[start:start + mini_batch_size]
+		s = states[mb_idx].to(dev)
+		t = targets[mb_idx].to(dev)
+		m = training_masks[mb_idx].to(dev)
+		logits = network.policy_logits(network(s))
+		diff = (logits - t) * m
+		loss = (diff ** 2).sum() / m.sum()
+		optimizer.zero_grad()
+		loss.backward()
+		torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
+		optimizer.step()
+		total_loss += loss.item()
+		# Track mean predictions vs targets for rolled actions
+		with torch.no_grad():
+			masked_preds = (logits * m).sum() / m.sum()
+			masked_targs = (t * m).sum() / m.sum()
+			total_pred += masked_preds.item()
+			total_target += masked_targs.item()
+		n_batches += 1
+	nb = max(1, n_batches)
+	return {
+		"mse_loss": total_loss / nb,
+		"mean_pred_margin": total_pred / nb,
+		"mean_target_margin": total_target / nb,
+	}
