@@ -1,24 +1,15 @@
-"""Profile rollout pipeline: from_snapshots + rollout_numba with compaction.
-
-Hard 25s timeout. Uses 2 games.
-Usage: python -u profile_rollouts.py"""
+"""Test optimized from_snapshots + compaction. Hard 25s timeout."""
 
 import sys, os, time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-
-DEADLINE = time.time() + 25
-def check(label=""):
-    if time.time() > DEADLINE:
-        print(f"TIMEOUT at {label}")
-        sys.exit(0)
 
 import torch
 import numpy as np
 import random
 from training import play_games_q_v6, attach_snapshots, _apply_action_to_game
 from encoding import decode_flat_action, INPUT_SIZE_V6
-from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
+from gpu_engine import from_snapshots, repeat_state
 from numba_engine import rollout_numba
 from network import FlatScoutNetwork
 from main import Q_PARAMS
@@ -29,7 +20,7 @@ network = FlatScoutNetwork(
     attention=cfg.get("attention"),
 ).cuda().eval()
 
-# Play 2 games
+# Play 2 games, get samples
 samples, game_replays = play_games_q_v6(
     network, 2, cfg["num_players"],
     training_seats=cfg.get("training_seats", cfg["num_players"]),
@@ -37,7 +28,6 @@ samples, game_replays = play_games_q_v6(
 )
 attach_snapshots(samples, game_replays)
 del game_replays
-check("setup")
 
 # Action selection
 ra, re = cfg["rollout_actions_per_sample"], cfg["rollout_actions_random_extra"]
@@ -55,7 +45,7 @@ for sample in samples:
         selected.update(random.sample(remaining, n_extra))
     sample.rolled_actions = sorted(selected)
 
-# Build games for 1 chunk
+# Build all games for 1 chunk
 chunk = []
 for si, sample in enumerate(samples):
     for ai, action_idx in enumerate(sample.rolled_actions):
@@ -74,51 +64,39 @@ for si, ai, action_idx in chunk:
     if g.phase.value < 3:
         games.append(g)
 
-print(f"{len(samples)} samples, {len(games)} games needing rollout", flush=True)
+print(f"{len(games)} games needing rollout", flush=True)
 
 # JIT warmup
-gpu_w = gpu_from_snapshots(games[:10], device='cuda')
+gpu_w = from_snapshots(games[:10], device='cuda')
 gpu_w = repeat_state(gpu_w, rpa)
 _ = rollout_numba(gpu_w, network, temperature=rt)
 torch.cuda.synchronize()
-print("JIT warm", flush=True)
-check("jit")
+print("JIT warm\n", flush=True)
 
-# Profile full chunk pipeline: from_snapshots + repeat + rollout
-# No compaction
+# Benchmark from_snapshots
+times = []
+for _ in range(5):
+    t0 = time.time()
+    gs = from_snapshots(games, device='cuda')
+    torch.cuda.synchronize()
+    times.append(time.time() - t0)
+print(f"from_snapshots ({len(games)} games): {min(times)*1000:.0f}ms best, {np.mean(times)*1000:.0f}ms avg")
+
+# Full pipeline benchmark
 t0 = time.time()
-gpu_a = gpu_from_snapshots(games, device='cuda')
-gpu_a = repeat_state(gpu_a, rpa)
-s_a = rollout_numba(gpu_a, network, temperature=rt, compact_threshold=0)
+gs = from_snapshots(games, device='cuda')
+gs = repeat_state(gs, rpa)
+scores = rollout_numba(gs, network, temperature=rt, compact_threshold=0.5)
 torch.cuda.synchronize()
-t_no = time.time() - t0
-print(f"No compaction (full chunk):   {t_no*1000:.0f}ms", flush=True)
-check("no_compact")
+t_total = time.time() - t0
+B = len(games) * rpa
+print(f"\nFull pipeline ({len(games)} games x {rpa} = {B} batch):")
+print(f"  Total: {t_total*1000:.0f}ms")
+print(f"  Scores: mean={scores[:,:4].float().mean():.2f}, range=[{scores.min()},{scores.max()}]")
 
-# With compaction
-t0 = time.time()
-gpu_b = gpu_from_snapshots(games, device='cuda')
-gpu_b = repeat_state(gpu_b, rpa)
-s_b = rollout_numba(gpu_b, network, temperature=rt, compact_threshold=0.5)
-torch.cuda.synchronize()
-t_compact = time.time() - t0
-print(f"With compaction (full chunk): {t_compact*1000:.0f}ms", flush=True)
-
-speedup = t_no / t_compact if t_compact > 0 else float('inf')
-print(f"Speedup: {speedup:.2f}x")
-
-# Break down from_snapshots time
-t0 = time.time()
-gpu_c = gpu_from_snapshots(games, device='cuda')
-torch.cuda.synchronize()
-t_snap = time.time() - t0
-print(f"\nfrom_snapshots: {t_snap*1000:.0f}ms for {len(games)} games")
-print(f"  (was ~300ms, now ~{t_snap*1000:.0f}ms)")
-
-# Extrapolate to full iteration (9 chunks)
-n_chunks = 9
-est_old = (300 + 1 + 3000) * n_chunks / 1000  # old: 300ms snap + rollout
-est_new = (t_snap * 1000 + 1 + t_compact * 1000 - t_snap * 1000) * n_chunks / 1000
-print(f"\n--- Extrapolation ({n_chunks} chunks) ---")
-print(f"  Before: ~{est_old:.0f}s  (300ms snap + 3000ms rollout)")
-print(f"  After:  ~{t_compact * n_chunks:.1f}s  ({t_snap*1000:.0f}ms snap + {(t_compact-t_snap)*1000:.0f}ms rollout)")
+# Correctness: verify from_snapshots produces valid state
+gs2 = from_snapshots(games[:5], device='cuda')
+print(f"\n  State check: hands_show range [{gs2.hands_show.min()},{gs2.hands_show.max()}]")
+print(f"  hand_len: {gs2.hand_len[:5].tolist()}")
+print(f"  num_players: {gs2.num_players[:5].tolist()}")
+print(f"  done: {gs2.done[:5].tolist()}")

@@ -24,9 +24,9 @@ Do not edit this section without asking the user.
 
 ## Architecture
 
-- **FlatScoutNetwork** — Self-attention over 20 per-card entities → FC trunk (Linear → LayerNorm → GELU) → flat head (384 predicted margins). No value head — state value = max predicted margin over legal actions.
+- **FlatScoutNetwork** — Self-attention over 20 per-card entities (single-head d=64, 2 layers, SDPA fused kernel) → FC trunk `[512, 256, 256, 128, 128]` (Linear → LayerNorm → GELU) → flat head (384 predicted margins). No value head — state value = max predicted margin over legal actions.
 - **`forward()` returns hidden tensor directly.** `policy_logits()` maps hidden → 384 outputs. `state_value(logits, mask)` is a static method for max-Q.
-- **Attention**: entities are 16 hand slots + 4 scout card options. Each has 13 raw features + 20-dim positional one-hot → projected to `dim` → self-attention layers with pre-norm residuals. Config in `Q_PARAMS["attention"]`.
+- **Attention**: entities are 16 hand slots + 4 scout card options. Each has 13 raw features + 20-dim positional one-hot → projected to `dim` → `F.scaled_dot_product_attention` → out Linear, with pre-norm residuals.
 - **ScoutNetwork** — FC-only with sub-head action decomposition and value head. Used by older eval checkpoints (v1-v4).
 
 ## Q-Network Training Pipeline
@@ -37,14 +37,13 @@ Per iteration: `play_games_q_v6` → [`curate_samples`] → `attach_snapshots` �
 
 - **Deferred snapshots**: `play_games_q_v6` returns `(samples, game_replays)`. Samples have `snapshot=None`; game_replays stores initial state + flip decisions + action list per game. `attach_snapshots()` replays only games with surviving samples to create Game clones on demand.
 - **Sample curation** (`curation_multiplier` config): plays N× more games, scores each sample by inverse frequency of its legal actions (rotation-aware), subsamples to equalize per-output-neuron training signal.
-- **Multi-action rollouts**: top-K + random extra actions per decision point. `action_taken` always included. Batched through GPU in chunks of 512 pairs × N rollouts.
-- **Rollout temperature**: `rollout_numba` accepts `temperature` param. 0.0 = greedy, 1.0 = softmax sampling.
-- **Action selection** (game play): softmax(temperature) + epsilon-greedy.
-- **Replay buffer**: cohort-based. Periodic revalidation re-rollouts a subset (batched in chunks of 512); weight = `max(0, 1 - mae / margin_max_diff)`. Dead cohorts removed. Known issue: revalidation MAE is dominated by rollout noise, not policy drift — cohorts settle to ~0.5 weight and never get pruned.
-- **Augmentation**: on-the-fly via `FULL_PERM`/`HAND_SHIFT` permutation tables. All 16 rotations (including identity).
+- **Multi-action rollouts**: top-K + random extra actions per decision point. `action_taken` always included. Batched through GPU in chunks of 512 pairs × N rollouts. Supports `probe_reward` param to skip rollouts and assign deterministic targets for architecture validation.
+- **Action selection**: gameplay uses `_select_action_q_batched` — softmax(logits/temperature) + epsilon-greedy. Eval uses `_play_turn_v6` which detects Q-networks via `not hasattr(net, 'value')` and uses argmax (greedy).
+- **Replay buffer**: sliding-window cohort buffer. `replay_window` config controls how many iterations of data to keep. `replay_window: N` means each sample is trained on ~N times, plus 16x augmentation.
 - **Flip decisions**: max predicted margin over play actions [0..255] for each hand orientation.
-- **Charts**: 4×4 grid in `_save_q_charts()`. Row 0: eval margins, MSE, pred vs target, steps/game. Row 1: play length distribution, avg play length, scout play length, action type distribution. Row 2: entropies, dormant neurons, rollout margins histogram, rollout signal vs noise. Row 3: margin predictions histogram, replay cohorts by age, (hidden), (hidden).
-- **Progress bars**: tqdm on outer training loop (hidden during inner bars), inner bars for games and rollouts.
+- **Charts**: 4×4 grid in `_save_q_charts()`. Row 0: eval margins, MSE, pred vs target, steps/game. Row 1: play length dist, avg play length, scout play length, action type dist (post-curation). Row 2: margin hist, rollout hist, signal vs noise, (hidden). Row 3: entropies, dormant neurons, (hidden), (hidden).
+- **Signal vs noise chart**: `mean_rollout_std` in metrics_history actually stores SE (not raw std).
+- **Eval config**: `eval_games` controls games per opponent (default 40). `eval_scout_quality` uses 2000 samples with greedy (argmax) action selection.
 
 ## Encoding
 
@@ -53,9 +52,7 @@ Per iteration: `play_games_q_v6` → [`curate_samples`] → `attach_snapshots` �
 
 ## GPU Engine & Rollouts
 
-`rollout_numba` in `numba_engine.py`: 4 Numba CUDA kernels + PyTorch network forward. Active-game compaction: forward pass only runs on non-done games each step. Forward pass chunked at 1024 samples (RTX 3060).
-
-Pipeline: `from_snapshots` (gpu_engine.py) → `repeat_state` → `rollout_numba` → margin computation. `gpu_engine.py` is the reference/test oracle.
+`rollout_numba` in `numba_engine.py`: 4 Numba CUDA kernels + PyTorch network forward. Active-game compaction at two levels: forward pass only runs on non-done games each step; batch-level compaction (`compact_threshold`, default 0.5) gathers only active games into smaller tensors when active fraction drops below threshold. Forward pass chunked at 1024 samples (RTX 3060).
 
 Key design facts: hands are left-aligned (not circular), S&S is two steps via `state.phase`, `compute_legal_plays` returns hand-position space (not slot space).
 
@@ -73,11 +70,18 @@ Changes to encoding/masking logic must be updated in both `.py` and `.pyx`. Buil
 
 Scripts use `SCRIPT_DIR` pattern. Use `python -u` for unbuffered output when running training in background.
 
+## Game Visualization
+
+Q-network path does not save game logs. PPO path saves them at `save_interval`. To replay a saved game: `python scout-bot/main.py --replay <path.json>`. To run a match (scores only): `python scout-bot/main.py --match <agent1> <agent2> ...`. No way to watch a Q-network game live yet.
+
 ## Key File Locations
 
-- `scout-bot/main.py` — `Q_PARAMS`, `train_q()`, `_save_q_charts()` (4×4 grid + summary.txt), `_run_eval()`
+- `scout-bot/main.py` — `Q_PARAMS`, `train_q()`, `_save_q_charts()`, `_run_eval()`
 - `scout-bot/training.py` — `QSample`, `ReplayBuffer`, `play_games_q_v6`, `attach_snapshots`, `curate_samples`, `rollout_multi_action_v6`, `prepare_q_batch_v6`, `q_update_v6`
 - `scout-bot/network.py` — FlatScoutNetwork, ScoutNetwork (v1-v4)
-- `scout-bot/encoding.py` — state encoding (v1-v6), mask functions, action decoding, permutation tables
+- `scout-bot/encoding.py` — state encoding (v1-v6), mask functions, action decoding, permutation tables, `get_legal_plays`
 - `scout-bot/game.py` — game engine; cards are `(showing_value, hidden_value)` tuples
 - `scout-bot/numba_engine.py` — Numba CUDA rollout engine
+- `scout-bot/probe.py` — `eval_scout_quality` (2000 samples, greedy) and other probe functions
+- `scout-bot/matchup.py` — `--match` mode agent loading and matchup runner
+- `scout-bot/game_log.py` — `GameLog`, `print_replay` for game visualization

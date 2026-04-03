@@ -652,17 +652,59 @@ def apply_actions_kernel(
 
 # ── Rollout entry point ──────────────────────────────────────────────────────
 
+def _wrap_state_for_numba(state, legal_buf, mask_buf, encode_buf):
+	"""Wrap all state + buffer tensors as Numba CUDA arrays (zero-copy)."""
+	return (
+		cuda.as_cuda_array(state.hands_show),
+		cuda.as_cuda_array(state.hands_hide),
+		cuda.as_cuda_array(state.hand_len),
+		cuda.as_cuda_array(state.play_show),
+		cuda.as_cuda_array(state.play_hide),
+		cuda.as_cuda_array(state.play_len),
+		cuda.as_cuda_array(state.play_owner),
+		cuda.as_cuda_array(state.play_type),
+		cuda.as_cuda_array(state.play_strength),
+		cuda.as_cuda_array(state.current_player),
+		cuda.as_cuda_array(state.phase),
+		cuda.as_cuda_array(state.scouts_since_play),
+		cuda.as_cuda_array(state.sns_available),
+		cuda.as_cuda_array(state.num_players),
+		cuda.as_cuda_array(state.collected),
+		cuda.as_cuda_array(state.scout_tokens),
+		cuda.as_cuda_array(state.round_ender),
+		cuda.as_cuda_array(state.done),
+		cuda.as_cuda_array(legal_buf),
+		cuda.as_cuda_array(mask_buf),
+		cuda.as_cuda_array(encode_buf),
+	)
+
+def _compact_state(state, active_idx):
+	"""Gather only active games into a new compact GpuGameState."""
+	from dataclasses import fields
+	kwargs = {}
+	for f in fields(state):
+		t = getattr(state, f.name)
+		kwargs[f.name] = t[active_idx].contiguous()
+	return GpuGameState(**kwargs)
+
 def rollout_numba(
 	state: GpuGameState,
 	network,
 	max_steps: int = MAX_STEPS,
 	temperature: float = 1.0,
+	compact_threshold: float = 0.5,
 ) -> Tensor:
 	"""Run all games until done (or max_steps if set), return [B, MAX_P] score tensor.
-	temperature: action sampling temperature (1.0 = softmax, 0.0 = greedy)."""
+	temperature: action sampling temperature (1.0 = softmax, 0.0 = greedy).
+	compact_threshold: compact batch when active fraction drops below this (0 to disable)."""
 	from network import batched_masked_sample
-	B = state.done.shape[0]
+	B_orig = state.done.shape[0]
+	B = B_orig
 	dev = state.done.device
+
+	# Score accumulator for compacted-out (done) games
+	scores_out = torch.zeros(B_orig, MAX_P, dtype=torch.long, device=dev)
+	idx_map = torch.arange(B_orig, device=dev)  # current[i] → original[idx_map[i]]
 
 	# Pre-allocate output tensors (reused each step)
 	legal_buf = torch.zeros(B, H, H, dtype=torch.bool, device=dev)
@@ -670,27 +712,11 @@ def rollout_numba(
 	encode_buf = torch.zeros(B, 309, dtype=torch.float32, device=dev)
 
 	# Wrap state tensors for Numba (zero-copy)
-	d_hands_show = cuda.as_cuda_array(state.hands_show)
-	d_hands_hide = cuda.as_cuda_array(state.hands_hide)
-	d_hand_len = cuda.as_cuda_array(state.hand_len)
-	d_play_show = cuda.as_cuda_array(state.play_show)
-	d_play_hide = cuda.as_cuda_array(state.play_hide)
-	d_play_len = cuda.as_cuda_array(state.play_len)
-	d_play_owner = cuda.as_cuda_array(state.play_owner)
-	d_play_type = cuda.as_cuda_array(state.play_type)
-	d_play_strength = cuda.as_cuda_array(state.play_strength)
-	d_current_player = cuda.as_cuda_array(state.current_player)
-	d_phase = cuda.as_cuda_array(state.phase)
-	d_scouts_since_play = cuda.as_cuda_array(state.scouts_since_play)
-	d_sns_available = cuda.as_cuda_array(state.sns_available)
-	d_num_players = cuda.as_cuda_array(state.num_players)
-	d_collected = cuda.as_cuda_array(state.collected)
-	d_scout_tokens = cuda.as_cuda_array(state.scout_tokens)
-	d_round_ender = cuda.as_cuda_array(state.round_ender)
-	d_done = cuda.as_cuda_array(state.done)
-	d_legal = cuda.as_cuda_array(legal_buf)
-	d_mask = cuda.as_cuda_array(mask_buf)
-	d_encode = cuda.as_cuda_array(encode_buf)
+	(d_hands_show, d_hands_hide, d_hand_len,
+	 d_play_show, d_play_hide, d_play_len, d_play_owner, d_play_type, d_play_strength,
+	 d_current_player, d_phase, d_scouts_since_play, d_sns_available, d_num_players,
+	 d_collected, d_scout_tokens, d_round_ender, d_done,
+	 d_legal, d_mask, d_encode) = _wrap_state_for_numba(state, legal_buf, mask_buf, encode_buf)
 
 	grid = _grid(B)
 
@@ -703,13 +729,44 @@ def rollout_numba(
 		while True:
 			# Get active game indices (single sync replaces active.any() check)
 			active_idx = torch.where(~state.done)[0]
-			if active_idx.shape[0] == 0:
+			n_active = active_idx.shape[0]
+			if n_active == 0:
 				break
 			if max_steps is not None and step >= max_steps:
 				break
+
+			# Compact batch when active fraction is low
+			if compact_threshold > 0 and n_active < B * compact_threshold and n_active < B:
+				# Save scores for done games before discarding them
+				done_mask = state.done
+				if done_mask.any():
+					done_scores = compute_scores_tensor(state)
+					done_idx = torch.where(done_mask)[0]
+					scores_out[idx_map[done_idx]] = done_scores[done_idx]
+
+				# Compact to only active games
+				idx_map = idx_map[active_idx]
+				state = _compact_state(state, active_idx)
+				B = n_active
+
+				# Reallocate buffers for new size
+				legal_buf = torch.zeros(B, H, H, dtype=torch.bool, device=dev)
+				mask_buf = torch.zeros(B, FLAT_ACTION_SIZE, dtype=torch.bool, device=dev)
+				encode_buf = torch.zeros(B, 309, dtype=torch.float32, device=dev)
+				logits = torch.zeros(B, FLAT_ACTION_SIZE, device=dev)
+
+				(d_hands_show, d_hands_hide, d_hand_len,
+				 d_play_show, d_play_hide, d_play_len, d_play_owner, d_play_type, d_play_strength,
+				 d_current_player, d_phase, d_scouts_since_play, d_sns_available, d_num_players,
+				 d_collected, d_scout_tokens, d_round_ender, d_done,
+				 d_legal, d_mask, d_encode) = _wrap_state_for_numba(state, legal_buf, mask_buf, encode_buf)
+
+				grid = _grid(B)
+				active_idx = torch.where(~state.done)[0]
+				n_active = active_idx.shape[0]
+
 			step += 1
 			active = ~state.done
-			n_active = active_idx.shape[0]
 
 			hand_offsets = torch.randint(0, H, (B,), device=dev, dtype=torch.long)
 			d_offsets = cuda.as_cuda_array(hand_offsets)
@@ -782,4 +839,8 @@ def rollout_numba(
 				d_apply_active, B,
 			)
 
-	return compute_scores_tensor(state)
+	# Write remaining scores and return
+	if B > 0:
+		remaining_scores = compute_scores_tensor(state)
+		scores_out[idx_map] = remaining_scores
+	return scores_out

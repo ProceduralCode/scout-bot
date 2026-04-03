@@ -88,137 +88,27 @@ class QSample:
 	rollout_stds: list[float] | None = None
 
 class ReplayBuffer:
-	"""Cohort-based replay buffer with periodic revalidation.
-	Each cohort is one iteration's worth of training samples."""
+	"""Sliding-window replay buffer. Keeps the last `window` iterations of samples."""
 
-	def __init__(self):
+	def __init__(self, window: int = 1):
 		self.cohorts: list[dict] = []
+		self.window = window
 
 	def add_cohort(self, iteration: int, samples: list[QSample]):
-		self.cohorts.append({
-			"iteration": iteration,
-			"samples": samples,
-			"alive": True,
-			"weight": 1.0,
-			"last_validated": None,
-		})
+		self.cohorts.append({"iteration": iteration, "samples": samples})
+		if len(self.cohorts) > self.window:
+			self.cohorts = self.cohorts[-self.window:]
 
-	def get_alive_cohorts(self) -> list[dict]:
-		return [c for c in self.cohorts if c["alive"]]
-
-	def sample_training_data(self, fresh_samples: list[QSample]) -> list[QSample]:
-		"""Combine fresh samples with weighted replay from alive cohorts."""
-		result = list(fresh_samples)
-		for cohort in self.cohorts:
-			if not cohort["alive"]:
-				continue
-			# Skip the freshest cohort (it IS the fresh_samples)
-			if cohort is self.cohorts[-1]:
-				continue
-			n_take = max(1, int(cohort["weight"] * len(cohort["samples"])))
-			if n_take >= len(cohort["samples"]):
-				result.extend(cohort["samples"])
-			else:
-				result.extend(random.sample(cohort["samples"], n_take))
-		return result
-
-	def revalidate(self, network, cohort: dict, check_perc: float,
-				   rollouts_per_action: int, num_players: int,
-				   margin_max_diff: float, min_replay_perc: float,
-				   rollout_temperature: float = 1.0, chunk_pairs: int = 512):
-		"""Re-rollout a subset of cohort samples with current network.
-		Updates cohort weight based on margin discrepancy. Marks dead if below threshold."""
-		samples = cohort["samples"]
-		n_check = max(1, int(check_perc * len(samples)))
-		check_samples = random.sample(samples, n_check)
-		from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
-		from numba_engine import rollout_numba
-		# Collect all (sample, action_pos, action_idx, old_margin) pairs
-		pairs = []
-		for sample in check_samples:
-			if sample.rolled_actions is None:
-				continue
-			for i, action_idx in enumerate(sample.rolled_actions):
-				pairs.append((sample, i, action_idx, sample.rollout_margins[i]))
-		if not pairs:
-			return
-		# Batched rollout in chunks
-		total_mae = 0.0
-		n_compared = 0
-		for chunk_start in range(0, len(pairs), chunk_pairs):
-			chunk = pairs[chunk_start:chunk_start + chunk_pairs]
-			games = []
-			rollout_info = []  # (game_idx_in_batch, chunk_idx)
-			for ci, (sample, action_pos, action_idx, old_margin) in enumerate(chunk):
-				g = sample.snapshot.clone()
-				action = decode_flat_action(action_idx, sample.hand_offset)
-				_apply_action_to_game(g, action)
-				if g.phase in (Phase.ROUND_OVER, Phase.GAME_OVER):
-					scores = g.cumulative_scores[:num_players]
-					ps = scores[sample.player]
-					total_s = sum(scores)
-					margin = (ps * num_players - total_s) / ((num_players - 1) * 10.0)
-					total_mae += abs(margin - old_margin)
-					n_compared += 1
-				else:
-					rollout_info.append((len(games), ci))
-					games.append(g)
-			if not games:
-				continue
-			gpu_state = gpu_from_snapshots(games, device='cuda')
-			gpu_state = repeat_state(gpu_state, rollouts_per_action)
-			scores_t = rollout_numba(gpu_state, network,
-									 temperature=rollout_temperature)
-			sf = scores_t[:, :num_players].float()
-			total_s = sf.sum(dim=1, keepdim=True)
-			all_margins = (sf * num_players - total_s) / ((num_players - 1) * 10.0)
-			all_margins = all_margins.view(len(games), rollouts_per_action, num_players)
-			for gi, ci in rollout_info:
-				sample, action_pos, action_idx, old_margin = chunk[ci]
-				new_margin = all_margins[gi, :, sample.player].mean().item()
-				total_mae += abs(new_margin - old_margin)
-				n_compared += 1
-		if n_compared == 0:
-			return
-		mae = total_mae / n_compared
-		# Linear fade: weight = max(0, 1 - mae / max_diff)
-		cohort["weight"] = max(0.0, 1.0 - mae / margin_max_diff)
-		cohort["last_validated"] = {"mae": mae, "n_compared": n_compared}
-		# Kill cohort if effective sample count too low
-		effective_pct = cohort["weight"]
-		if effective_pct < min_replay_perc:
-			cohort["alive"] = False
-
-	def check_and_prune(self, network, current_iteration: int,
-						cohort_check_interval: int, check_perc: float,
-						rollouts_per_action: int, num_players: int,
-						margin_max_diff: float, min_replay_perc: float,
-						rollout_temperature: float = 1.0):
-		"""Revalidate cohorts that are due and remove dead ones."""
-		for cohort in self.get_alive_cohorts():
-			# Skip the freshest cohort
-			if cohort is self.cohorts[-1]:
-				continue
-			age = current_iteration - cohort["iteration"]
-			if age > 0 and age % cohort_check_interval == 0:
-				self.revalidate(network, cohort, check_perc,
-								rollouts_per_action, num_players,
-								margin_max_diff, min_replay_perc,
-								rollout_temperature=rollout_temperature)
-		# Remove dead cohorts entirely
-		self.cohorts = [c for c in self.cohorts if c["alive"]]
+	def all_samples(self) -> list[QSample]:
+		return [s for c in self.cohorts for s in c["samples"]]
 
 	def stats(self) -> dict:
-		"""Summary stats for logging."""
-		alive = self.get_alive_cohorts()
 		return {
-			"alive_cohorts": len(alive),
-			"total_samples": sum(len(c["samples"]) for c in alive),
-			"weights": [c["weight"] for c in alive],
+			"cohorts": len(self.cohorts),
+			"total_samples": sum(len(c["samples"]) for c in self.cohorts),
 		}
 
 	def state_dict(self) -> dict:
-		"""Serialize for checkpointing."""
 		cohorts_data = []
 		for c in self.cohorts:
 			samples_data = []
@@ -241,26 +131,24 @@ class ReplayBuffer:
 			cohorts_data.append({
 				"iteration": c["iteration"],
 				"samples": samples_data,
-				"alive": c["alive"],
-				"weight": c["weight"],
-				"last_validated": c["last_validated"],
 			})
 		return {"cohorts": cohorts_data}
 
 	def load_state_dict(self, state: dict):
-		"""Restore from checkpoint."""
 		self.cohorts = []
 		for cd in state["cohorts"]:
+			if not cd.get("alive", True):
+				continue  # skip dead cohorts from old checkpoints
 			samples = []
 			for sd in cd["samples"]:
 				samples.append(QSample(**sd))
 			self.cohorts.append({
 				"iteration": cd["iteration"],
 				"samples": samples,
-				"alive": cd["alive"],
-				"weight": cd["weight"],
-				"last_validated": cd["last_validated"],
 			})
+		# Apply window limit
+		if len(self.cohorts) > self.window:
+			self.cohorts = self.cohorts[-self.window:]
 
 def _apply_action_to_game(game: Game, action: dict):
 	"""Apply a decoded action dict to a game. Used by rollout and revalidation."""
@@ -1750,8 +1638,13 @@ def _play_turn_v6(game: Game, networks: list, game_log=None) -> list[StepRecordV
 		if not mask_t.any():
 			game._advance_turn()
 			return records
-		action_idx, _ = masked_sample(logits, mask_t)
-		old_lp = masked_log_prob(logits, mask_t, action_idx).item()
+		is_q_network = not hasattr(net, 'value')
+		if is_q_network:
+			action_idx = logits.masked_fill(~mask_t, float('-inf')).argmax().item()
+			old_lp = 0.0
+		else:
+			action_idx, _ = masked_sample(logits, mask_t)
+			old_lp = masked_log_prob(logits, mask_t, action_idx).item()
 		action = decode_flat_action(action_idx, hand_offset)
 		rec = StepRecordV6(
 			state=state, action=action_idx, mask=mask_t.cpu().numpy(),
@@ -2851,11 +2744,15 @@ def rollout_multi_action_v6(samples: list[QSample], network, num_players: int,
 							rollout_actions_random_extra: int = 2,
 							rollouts_per_action: int = 30,
 							rollout_temperature: float = 1.0,
-							chunk_pairs: int = 512):
+							chunk_pairs: int = 512,
+							probe_reward: str | None = None):
 	"""Select top-K + random actions per sample, batch GPU rollout, fill margins/stds.
-	Modifies samples in-place (rolled_actions, rollout_margins, rollout_stds)."""
-	from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
-	from numba_engine import rollout_numba
+	Modifies samples in-place (rolled_actions, rollout_margins, rollout_stds).
+	probe_reward: if set, skip rollouts and assign deterministic targets.
+	  'play_length' = play size / 5.0 for plays, 0 for scouts."""
+	if probe_reward is None:
+		from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
+		from numba_engine import rollout_numba
 
 	# Step 1: Select which actions to roll out for each sample
 	for sample in samples:
@@ -2870,6 +2767,49 @@ def rollout_multi_action_v6(samples: list[QSample], network, num_players: int,
 		if n_extra > 0:
 			selected.update(random.sample(remaining, n_extra))
 		sample.rolled_actions = sorted(selected)
+
+	# Probe mode: skip rollouts, assign deterministic targets
+	if probe_reward is not None:
+		H = 16  # HAND_SLOTS_V6
+		for sample in samples:
+			sample.rollout_margins = []
+			sample.rollout_stds = []
+			for action_idx in sample.rolled_actions:
+				if probe_reward == 'play_length':
+					if action_idx < 256:
+						play_len = (action_idx % H - action_idx // H) % H + 1
+						sample.rollout_margins.append(play_len / 5.0)
+					else:
+						sample.rollout_margins.append(0.0)
+					sample.rollout_stds.append(0.0)
+				elif probe_reward == 'scout_quality':
+					if action_idx < 256:
+						sample.rollout_margins.append(0.0)
+					else:
+						offset = 256 if action_idx < 320 else 320
+						idx = action_idx - offset
+						card_choice = idx // H
+						slot = idx % H
+						insert_pos = (slot - sample.hand_offset) % H
+						left_end = card_choice < 2
+						flip = card_choice % 2 == 1
+						game = sample.snapshot
+						play_cards = game.current_play.cards
+						card = play_cards[0] if left_end else play_cards[-1]
+						if flip:
+							card = (card[1], card[0])
+						hand = list(game.players[game.current_player].hand)
+						new_hand = hand[:insert_pos] + [card] + hand[insert_pos:]
+						plays = get_legal_plays(new_hand, None)
+						max_len = 1
+						for s, e in plays:
+							if s <= insert_pos <= e:
+								max_len = max(max_len, e - s + 1)
+						sample.rollout_margins.append(max_len / 5.0)
+					sample.rollout_stds.append(0.0)
+				else:
+					raise ValueError(f'Unknown probe_reward: {probe_reward}')
+		return
 
 	# Step 2: Collect all (sample_idx, action_position, action_idx) pairs
 	pairs = []

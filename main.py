@@ -110,6 +110,7 @@ PARAMS = {
 	"save_interval_hours": 3,
 	# "eval_interval": 30,
 	"eval_interval": 5,
+	"eval_games": 40,
 	# "encoding_version": 2,
 	"encoding_version": 6,
 	"num_values": 10,
@@ -227,44 +228,38 @@ PARAMS = {
 
 Q_PARAMS = {
 	"num_players": 4,
-	"layer_sizes": [256, 128],
+	"attention": {"dim": 64, "heads": 1, "layers": 2},
+	# "layer_sizes": [256, 128],						#	459K	3.35ms
+	# "layer_sizes": [512, 256, 128],				#	932K	4.23ms
+	# "layer_sizes": [512, 512, 256, 128],			#	1.2M	4.62ms
+	"layer_sizes": [512, 256, 256, 128, 128],	#	1.0M	4.32ms
+	# "layer_sizes": [1024, 512, 256, 128],		#	2.1M	5.48ms
 	"learning_rate": 0.0003,
-	# "training_epochs": 3,
 	"training_epochs": 1,
 	"mini_batch_size": 1024 * 16,
-	# "game_count": 100,
-	"game_count": 10,
-	# "game_count": 1,
-	# "curation_multiplier": 3,
-	# "curation_multiplier": 10,
-	"curation_multiplier": 20,
-	"temperature": 0.5,
+	"game_count": 50,
+	"curation_multiplier": 10,
+	"temperature": 0.1,
 	"epsilon": 0.1,
-	# "rollout_actions_per_sample": 10,
-	"rollout_actions_per_sample": 4,
-	# "rollout_actions_random_extra": 2,
+	"rollout_actions_per_sample": 3,
 	"rollout_actions_random_extra": 1,
-	# "rollouts_per_action": 25, # probably want se of means to be about 0.3x spread of means, or just get se of means to a good value (in margin units)
-	"rollouts_per_action": 15,
-	"rollout_temperature": 0.3, # think gap size (in margin units) where it starts to have strong opinions
+	"rollouts_per_action": 15, # probably want se of means to be about 0.3x spread of means, or just get se of means to a good value (in margin units)
+	"rollout_temperature": 0.1, # think gap size (in margin units) where it starts to have strong opinions
 	"augment_rotations": 16,
-	# "cohort_check_interval": 5,
-	"cohort_check_interval": 1,
-	"replay_check_perc": 0.1,
-	"replay_margin_max_diff": 0.4,
-	"min_replay_perc": 0.3,
+	"replay_window": 4,
 	"log_interval": 1,
-	"eval_interval": 5,
 	"save_interval_hours": 3,
-	# "attention": {"dim": 20, "heads": 4, "layers": 3},
-	"attention": {"dim": 20, "heads": 4, "layers": 2},
-	"save_dir": "bots/v8_3",
+	"save_dir": "bots/v8_6",
+	"eval_games": 100,
+	# "eval_interval": 5,
+	"eval_interval": 30,
 	"eval_opponents": {
 		"v1_4": "bots/v1_4/latest.pt",
 		"v2_5": "bots/v2_5/latest.pt",
 		"v3_4": "bots/v3_4/latest.pt",
 		"v4_2": "bots/v4_2/latest.pt",
 	},
+	# "probe_reward": "scout_quality",
 
 	# Unused
 	"training_seats": 4,
@@ -353,7 +348,7 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 		network.cpu()
 	try:
 		network.eval()
-		n_eval = 40
+		n_eval = cfg.get("eval_games", 40)
 		metrics_history["eval_iteration"].append(iteration)
 		for name, eval_net in eval_opponents.items():
 			total_margin = 0.0
@@ -365,7 +360,7 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 			avg_margin = total_margin / n_eval
 			metrics_history[f"eval_margin_{name}"].append(avg_margin)
 			tqdm.write(f"  Eval vs {name}: margin={avg_margin:+.1f}")
-		scout_len, scout_n = eval_scout_quality(network, n_samples=200)
+		scout_len, scout_n = eval_scout_quality(network, n_samples=2000)
 		metrics_history["scout_play_len"].append(scout_len)
 		tqdm.write(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
 	except Exception as e:
@@ -880,7 +875,8 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 			("play_len_6_pct", "6", "#74c0fc"),
 			("play_len_7plus_pct", "7+", "#ffd43b"),
 		], "Play Length Distribution",
-			"Fraction of plays by length. Shift to longer = learning combos.")
+			"Fraction of plays by length. Shift to longer = learning combos.",
+			legend_loc="center left")
 		plot_line(axes[1, 1], "avg_play_length", "Avg Play Length",
 			"Mean cards per play action.", "#69db7c")
 		ax_sq = axes[1, 2]
@@ -896,56 +892,35 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 			("play_pct", "Play", "#69db7c"),
 			("scout_pct", "Scout", "#5dadec"),
 			("sns_pct", "S&S", "#ff6b6b"),
-		], "Action Type Distribution",
-			"Fraction of each action type.", ylim=(0, 1))
-		# Row 2: Network health + rollout quality
-		plot_multi(axes[2, 0], [
-			("entropy_play", "Play", "#5dadec"),
-			("entropy_scout", "Scout", "#ff6b6b"),
-		], "Conditional Entropies",
-			"Softmax entropy over margin predictions. Play/Scout regions separate. Low = converging.",
-			ylim=(0, None))
-		plot_multi(axes[2, 1], [
-			("dormant_neurons_layer_0", "Layer 0", "#ff6b6b"),
-			("dormant_neurons_layer_1", "Layer 1", "#ffa552"),
-			("dormant_neurons_layer_2", "Layer 2", "#69db7c"),
-			("dormant_neurons_total", "Total", "#e0aaff"),
-		], "Dormant Neurons",
-			"Neurons with mean |activation| < 0.01. High count = underutilized capacity.")
-		plot_hist_snapshot(axes[2, 2], "_hist_rollout_bins", "_hist_rollout_counts",
+		], "Action Type Distribution (post-curation)",
+			"Fraction of each action type in curated samples.", ylim=(0, 1))
+		# Row 2: Values and rollout quality
+		plot_hist_snapshot(axes[2, 0], "_hist_margin_bins", "_hist_margin_counts",
+			"Margin Predictions", "Distribution of predicted margins (latest snapshot).", "#5dadec")
+		plot_hist_snapshot(axes[2, 1], "_hist_rollout_bins", "_hist_rollout_counts",
 			"Rollout Margins", "Distribution of rollout margins (latest snapshot).", "#69db7c")
-		plot_multi(axes[2, 3], [
+		plot_multi(axes[2, 2], [
 			("rollout_margin_spread", "Spread of means", "#69db7c"),
 			("mean_rollout_std", "SE of means", "#ff6b6b"),
 		], "Rollout Signal vs Noise",
 			"Spread across action targets vs uncertainty per target. SE > spread = unreliable rankings.",
 			ylim=(0, None), legend_loc="lower left")
-		# Row 3: Replay buffer + distributions
-		plot_hist_snapshot(axes[3, 0], "_hist_margin_bins", "_hist_margin_counts",
-			"Margin Predictions", "Distribution of predicted margins (latest snapshot).", "#5dadec")
-		# Combined replay cohort chart: total + effective samples per age
-		ax_rc = axes[3, 1]
-		ax_rc.set_facecolor(PANEL)
-		cohort_ages = metrics_history.get("_cohort_ages")
-		cohort_total = metrics_history.get("_cohort_total_samples")
-		cohort_eff = metrics_history.get("_cohort_eff_samples")
-		if cohort_ages and cohort_total:
-			ax_rc.plot(cohort_ages, cohort_total, color="#e0aaff", alpha=0.5,
-					   linewidth=1.5, label="Total")
-			ax_rc.fill_between(cohort_ages, cohort_total, alpha=0.1, color="#e0aaff")
-		if cohort_ages and cohort_eff:
-			ax_rc.plot(cohort_ages, cohort_eff, color="#5dadec",
-					   linewidth=2, label="Effective")
-			ax_rc.fill_between(cohort_ages, cohort_eff, alpha=0.15, color="#5dadec")
-		ax_rc.invert_xaxis()
-		if ax_rc.get_legend_handles_labels()[1]:
-			ax_rc.legend(fontsize=7, loc="upper left")
-		ax_rc.set_title("Replay Cohorts by Age", color=TEXT, fontsize=11)
-		ax_rc.text(0.5, -0.15, textwrap.fill(
-			"Total vs effective (weighted) samples per cohort age. Gap = weight decay.", 45),
-			transform=ax_rc.transAxes, ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
-		ax_rc.tick_params(colors=SUBTEXT, labelsize=8)
-		ax_rc.grid(True, alpha=0.15, color=GRID)
+		axes[2, 3].set_visible(False)
+		# Row 3: Network health
+		plot_multi(axes[3, 0], [
+			("entropy_play", "Play", "#5dadec"),
+			("entropy_scout", "Scout", "#ff6b6b"),
+		], "Conditional Entropies",
+			"Softmax entropy over margin predictions. Play/Scout regions separate. Low = converging.",
+			ylim=(0, None), legend_loc="center left")
+		plot_multi(axes[3, 1], [
+			("dormant_neurons_layer_0", "Layer 0", "#ff6b6b"),
+			("dormant_neurons_layer_1", "Layer 1", "#ffa552"),
+			("dormant_neurons_layer_2", "Layer 2", "#69db7c"),
+			("dormant_neurons_total", "Total", "#e0aaff"),
+		], "Dormant Neurons",
+			"Neurons with mean |activation| < 0.01. High count = underutilized capacity.",
+			legend_loc="upper left")
 		axes[3, 2].set_visible(False)
 		axes[3, 3].set_visible(False)
 		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
@@ -1038,7 +1013,7 @@ def _compute_diagnostics(network, records, raw_advantages,
 		has_pair = False
 		for a in range(256):
 			if mask[a]:
-				length = (a % 16) - (a // 16) + 1
+				length = (a % 16 - a // 16) % 16 + 1
 				if length >= 2:
 					has_pair = True
 					break
@@ -1052,7 +1027,7 @@ def _compute_diagnostics(network, records, raw_advantages,
 		p_single, p_pair, p_3plus = 0.0, 0.0, 0.0
 		for a in range(256):
 			if mask[a]:
-				length = (a % 16) - (a // 16) + 1
+				length = (a % 16 - a // 16) % 16 + 1
 				p = probs[a].item()
 				if length == 1:
 					p_single += p
@@ -1605,7 +1580,7 @@ def train_q(config: dict | None = None):
 	network = FlatScoutNetwork(INPUT_SIZE_V6, cfg["layer_sizes"],
 		encoding_version=6, attention=cfg.get("attention"))
 	optimizer = torch.optim.Adam(network.parameters(), lr=cfg["learning_rate"])
-	replay_buffer = ReplayBuffer()
+	replay_buffer = ReplayBuffer(window=cfg["replay_window"])
 	metrics_history = {
 		"iteration": [],
 		"mse_loss": [],
@@ -1619,7 +1594,6 @@ def train_q(config: dict | None = None):
 		"play_len_7plus_pct": [],
 		"eval_iteration": [],
 		"scout_play_len": [],
-		"replay_alive_cohorts": [], "replay_total_samples": [],
 		"dormant_neurons_total": [],
 		"dormant_neurons_layer_0": [], "dormant_neurons_layer_1": [],
 		"dormant_neurons_layer_2": [],
@@ -1732,19 +1706,12 @@ def train_q(config: dict | None = None):
 				rollout_actions_random_extra=cfg["rollout_actions_random_extra"],
 				rollouts_per_action=cfg["rollouts_per_action"],
 				rollout_temperature=cfg["rollout_temperature"],
+				probe_reward=cfg.get("probe_reward"),
 			)
 			rollout_time = time.time() - t1
 			# Replay buffer management
 			replay_buffer.add_cohort(iteration, samples)
-			if iteration > 1:
-				replay_buffer.check_and_prune(
-					network, iteration,
-					cfg["cohort_check_interval"], cfg["replay_check_perc"],
-					cfg["rollouts_per_action"], cfg["num_players"],
-					cfg["replay_margin_max_diff"], cfg["min_replay_perc"],
-					rollout_temperature=cfg["rollout_temperature"],
-				)
-			all_samples = replay_buffer.sample_training_data(samples)
+			all_samples = replay_buffer.all_samples()
 			# Prepare batch with augmentation
 			states, targets, train_masks = prepare_q_batch_v6(
 				all_samples, cfg["augment_rotations"])
@@ -1817,35 +1784,6 @@ def train_q(config: dict | None = None):
 					counts, edges = _np.histogram(rollout_margins_all, bins=40)
 					metrics_history["_hist_rollout_bins"] = edges.tolist()
 					metrics_history["_hist_rollout_counts"] = counts.tolist()
-				# Replay buffer age distribution
-				ages = []
-				for c in replay_buffer.get_alive_cohorts():
-					age = iteration - c["iteration"]
-					ages.extend([age] * len(c["samples"]))
-				if ages:
-					import numpy as _np
-					max_age = max(ages) + 1
-					bins = list(range(max_age + 1))
-					counts, edges = _np.histogram(ages, bins=bins)
-					metrics_history["_hist_age_bins"] = edges.tolist()
-					metrics_history["_hist_age_counts"] = counts.tolist()
-				# Replay cohort composition: total and effective samples per cohort age
-				cohort_ages = []
-				cohort_total_samples = []
-				cohort_eff_samples = []
-				for c in replay_buffer.get_alive_cohorts():
-					age = iteration - c["iteration"]
-					n_total = len(c["samples"])
-					if c is replay_buffer.cohorts[-1]:
-						n_eff = n_total  # current cohort: all used
-					else:
-						n_eff = max(1, int(c["weight"] * n_total))
-					cohort_ages.append(age)
-					cohort_total_samples.append(n_total)
-					cohort_eff_samples.append(n_eff)
-				metrics_history["_cohort_ages"] = cohort_ages
-				metrics_history["_cohort_total_samples"] = cohort_total_samples
-				metrics_history["_cohort_eff_samples"] = cohort_eff_samples
 				# Store metrics
 				metrics_history["iteration"].append(iteration)
 				metrics_history["mse_loss"].append(avg_metrics["mse_loss"])
@@ -1861,8 +1799,6 @@ def train_q(config: dict | None = None):
 				for i in range(1, 7):
 					metrics_history[f"play_len_{i}_pct"].append(play_len_pcts[i])
 				metrics_history["play_len_7plus_pct"].append(play_len_pcts[7])
-				metrics_history["replay_alive_cohorts"].append(rb_stats["alive_cohorts"])
-				metrics_history["replay_total_samples"].append(rb_stats["total_samples"])
 				if dormant_info:
 					metrics_history["dormant_neurons_total"].append(dormant_info["total"])
 					for li in range(3):
@@ -1888,7 +1824,7 @@ def train_q(config: dict | None = None):
 					  f"targ={avg_metrics['mean_target_margin']:+.3f}  "
 					  f"ent_p={avg_play_ent:.2f} ent_s={avg_scout_ent:.2f}  "
 					  f"steps={n_steps}  "
-					  f"buf={rb_stats['alive_cohorts']}c/{rb_stats['total_samples']}s  "
+					  f"buf={rb_stats['cohorts']}c/{rb_stats['total_samples']}s  "
 					  f"pool={len(pool.versions)}  "
 					  f"play={play_time:.1f}s  ro={rollout_time:.1f}s  train={train_time:.1f}s  "
 					  f"mem={_rss()}")
@@ -1932,6 +1868,10 @@ def main():
 		help="Play agents against each other (e.g., random path/to/model.pt)")
 	parser.add_argument("--games", type=int, default=100,
 		help="Number of games for --match (default: 100)")
+	parser.add_argument("--show", type=str, default=None, metavar="FILE",
+		help="Write game replays to FILE (use with --match or --watch)")
+	parser.add_argument("--watch", type=str, default=None, metavar="CHECKPOINT",
+		help="Play a checkpoint against itself and show games (use with --players, --games, --show)")
 	parser.add_argument("--profile", type=int, default=None, metavar="N",
 		help="Profile N training iterations with pyinstrument, then exit")
 	parser.add_argument("--mode", type=str, default="q", choices=["ppo", "q"],
@@ -1942,6 +1882,19 @@ def main():
 		log = GameLog.load(args.replay)
 		print_replay(log)
 		return
+	if args.watch:
+		from matchup import load_agent, run_matchup
+		num_players = args.players or 4
+		num_games = args.games if args.games != 100 else 3
+		agent = load_agent(args.watch)
+		agents = [agent] * num_players
+		# Default show file: same directory as checkpoint
+		show_file = args.show
+		if not show_file:
+			ckpt_dir = os.path.dirname(os.path.abspath(args.watch))
+			show_file = os.path.join(ckpt_dir, "games.txt")
+		run_matchup(agents, num_games, show_file=show_file)
+		return
 	if args.match:
 		from matchup import load_agent, run_matchup
 		num_players = args.players or len(args.match)
@@ -1949,7 +1902,7 @@ def main():
 		if len(agents) != num_players:
 			print(f"Error: --match needs {num_players} agents (got {len(agents)})")
 			return
-		run_matchup(agents, args.games)
+		run_matchup(agents, args.games, show_file=args.show)
 		return
 	config = {k: v for k, v in {
 		"num_players": args.players,

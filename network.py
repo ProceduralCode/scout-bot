@@ -239,8 +239,11 @@ class FlatScoutNetwork(nn.Module):
 			for _ in range(num_layers):
 				self.attn_layers.append(nn.ModuleDict({
 					'norm': nn.LayerNorm(d_model),
-					'attn': nn.MultiheadAttention(d_model, num_heads, batch_first=True),
+					'qkv': nn.Linear(d_model, 3 * d_model),
+					'out': nn.Linear(d_model, d_model),
 				}))
+			self._num_heads = num_heads
+			self._head_dim = d_model // num_heads
 			trunk_input = NUM_ENTITIES_V6 * d_model + GLOBAL_DIM_V6
 		else:
 			trunk_input = input_size
@@ -261,6 +264,22 @@ class FlatScoutNetwork(nn.Module):
 		output_size = layer_sizes[-1]
 		self.policy_head = nn.Linear(output_size, FLAT_ACTION_SIZE)
 
+	def load_state_dict(self, state_dict, **kwargs):
+		"""Handle old nn.MultiheadAttention keys → new qkv/out keys."""
+		mapped = {}
+		for k, v in state_dict.items():
+			if '.attn.in_proj_weight' in k:
+				mapped[k.replace('.attn.in_proj_weight', '.qkv.weight')] = v
+			elif '.attn.in_proj_bias' in k:
+				mapped[k.replace('.attn.in_proj_bias', '.qkv.bias')] = v
+			elif '.attn.out_proj.weight' in k:
+				mapped[k.replace('.attn.out_proj.weight', '.out.weight')] = v
+			elif '.attn.out_proj.bias' in k:
+				mapped[k.replace('.attn.out_proj.bias', '.out.bias')] = v
+			else:
+				mapped[k] = v
+		return super().load_state_dict(mapped, **kwargs)
+
 	def forward(self, x: Tensor) -> Tensor:
 		"""Returns hidden representation from trunk."""
 		if self._use_attention:
@@ -272,12 +291,21 @@ class FlatScoutNetwork(nn.Module):
 			pos = self.position_onehots.expand(x.shape[0], -1, -1)
 			entities = torch.cat([entities, pos], dim=2)  # [batch, 20, 33]
 			entities = self.entity_proj(entities)  # [batch, 20, d_model]
-			# Pre-norm self-attention with residual connections
+			# Pre-norm self-attention with residual connections (SDPA fused kernel)
+			B_size, S, D = entities.shape
+			H = self._num_heads
+			HD = self._head_dim
 			for layer in self.attn_layers:
 				residual = entities
-				entities = layer['norm'](entities)
-				entities, _ = layer['attn'](entities, entities, entities)
-				entities = residual + entities
+				normed = layer['norm'](entities)
+				qkv = layer['qkv'](normed)  # [B, S, 3*D]
+				Q, K, V = qkv.chunk(3, dim=-1)  # each [B, S, D]
+				Q = Q.view(B_size, S, H, HD).transpose(1, 2)
+				K = K.view(B_size, S, H, HD).transpose(1, 2)
+				V = V.view(B_size, S, H, HD).transpose(1, 2)
+				out = F.scaled_dot_product_attention(Q, K, V)
+				out = out.transpose(1, 2).reshape(B_size, S, D)
+				entities = residual + layer['out'](out)
 			# Flatten attention output, concat global features, run FC trunk
 			combined = torch.cat([entities.flatten(1),
 				x[:, GLOBAL_START_V6:]], dim=1)

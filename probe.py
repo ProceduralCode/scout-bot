@@ -590,7 +590,8 @@ def _sample_scout(network, game, player=1):
 		with torch.no_grad():
 			hidden = network(state)
 			logits = network.policy_logits(hidden)
-			action_idx, _ = masked_sample(logits, scout_mask)
+			greedy = logits.masked_fill(~scout_mask, float('-inf'))
+			action_idx = greedy.argmax().item()
 		action = decode_flat_action(action_idx, ho)
 		left_end, flip = action['left_end'], action['flip']
 		scouted = play_cards[0] if left_end else play_cards[-1]

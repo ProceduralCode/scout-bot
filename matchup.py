@@ -1,5 +1,6 @@
 import random
 import os
+import contextlib
 import torch
 from encoding import (
 	INPUT_SIZE, INPUT_SIZE_V2, INPUT_SIZE_V6,
@@ -7,6 +8,7 @@ from encoding import (
 )
 from network import ScoutNetwork, FlatScoutNetwork, RandomBot
 from training import play_eval_game
+from game_log import GameLog, print_replay
 
 class Agent:
 	"""Wrapper for a network-like object with a display name."""
@@ -43,7 +45,7 @@ def load_agent(spec: str) -> Agent:
 		return Agent(os.path.basename(spec), network)
 	raise ValueError(f"Unknown agent spec: {spec!r} (use 'random' or a .pt path)")
 
-def run_matchup(agents: list[Agent], num_games: int):
+def run_matchup(agents: list[Agent], num_games: int, show_file: str | None = None):
 	"""Play games between agents, shuffling seats each game for fairness."""
 	num_players = len(agents)
 	# Build display names (disambiguate duplicates)
@@ -67,12 +69,16 @@ def run_matchup(agents: list[Agent], num_games: int):
 		print(f"  Agent {i}: {name}")
 	print()
 
+	logs = []
 	indices = list(range(num_players))
 	for g in range(num_games):
 		# Shuffle seating for fairness
 		random.shuffle(indices)
 		networks = [agents[indices[seat]].network for seat in range(num_players)]
-		scores = play_eval_game(networks, num_players)
+		game_log = GameLog(num_players) if show_file else None
+		scores = play_eval_game(networks, num_players, game_log=game_log)
+		if game_log:
+			logs.append((game_log, [display_names[indices[seat]] for seat in range(num_players)]))
 		# Map scores back to agents
 		max_score = max(scores)
 		for seat in range(num_players):
@@ -94,3 +100,12 @@ def run_matchup(agents: list[Agent], num_games: int):
 		wr = wins[i] / num_games * 100
 		avg = total_score[i] / num_games
 		print(f"{display_names[i]:<20} {wins[i]:>6} {wr:>6.1f}% {avg:>10.1f}")
+
+	if show_file and logs:
+		with open(show_file, "w") as f:
+			for i, (log, seat_names) in enumerate(logs):
+				with contextlib.redirect_stdout(f):
+					seat_str = ', '.join(f'P{j}={seat_names[j]}' for j in range(num_players))
+					print(f"\n--- Game {i+1} ({seat_str}) ---")
+					print_replay(log)
+		print(f"\n{len(logs)} game replay(s) written to {show_file}")

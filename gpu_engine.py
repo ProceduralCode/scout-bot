@@ -65,77 +65,84 @@ class GpuGameState:
 def from_snapshots(snapshots: list[Game], device: str = 'cuda') -> GpuGameState:
 	"""Convert a list of Python Game snapshots to a batched GPU game state.
 	Snapshots should be in TURN or SNS_PLAY phase (standard rollout starting points)."""
+	import numpy as np
 	B = len(snapshots)
 
-	hands_show    = torch.zeros(B, MAX_P, H, dtype=torch.int8)
-	hands_hide    = torch.zeros(B, MAX_P, H, dtype=torch.int8)
-	hand_len      = torch.zeros(B, MAX_P,    dtype=torch.int8)
-	play_show     = torch.zeros(B, MAX_PLAY, dtype=torch.int8)
-	play_hide     = torch.zeros(B, MAX_PLAY, dtype=torch.int8)
-	play_len      = torch.zeros(B,           dtype=torch.int8)
-	play_owner    = torch.full((B,), -1,     dtype=torch.int8)
-	play_type     = torch.zeros(B,           dtype=torch.int8)
-	play_strength = torch.zeros(B,           dtype=torch.int8)
-	current_player    = torch.zeros(B,       dtype=torch.int8)
-	phase             = torch.zeros(B,       dtype=torch.int8)
-	scouts_since_play = torch.zeros(B,       dtype=torch.int8)
-	sns_available     = torch.ones(B, MAX_P, dtype=torch.bool)
-	num_players       = torch.zeros(B,       dtype=torch.int8)
-	collected     = torch.zeros(B, MAX_P,    dtype=torch.int8)
-	scout_tokens  = torch.zeros(B, MAX_P,    dtype=torch.int8)
-	round_ender   = torch.full((B,), -1,     dtype=torch.int8)
-	done          = torch.zeros(B,           dtype=torch.bool)
+	# Use numpy arrays for fast bulk filling, convert to torch at the end
+	hs = np.zeros((B, MAX_P, H), dtype=np.int8)
+	hh = np.zeros((B, MAX_P, H), dtype=np.int8)
+	hl = np.zeros((B, MAX_P), dtype=np.int8)
+	ps_buf = np.zeros((B, MAX_PLAY), dtype=np.int8)
+	ph_buf = np.zeros((B, MAX_PLAY), dtype=np.int8)
+	pl_buf = np.zeros(B, dtype=np.int8)
+	po_buf = np.full(B, -1, dtype=np.int8)
+	pt_buf = np.zeros(B, dtype=np.int8)
+	pstr_buf = np.zeros(B, dtype=np.int8)
+	cp_buf = np.zeros(B, dtype=np.int8)
+	phase_buf = np.zeros(B, dtype=np.int8)
+	ssp_buf = np.zeros(B, dtype=np.int8)
+	sns_buf = np.ones((B, MAX_P), dtype=np.bool_)
+	np_buf = np.zeros(B, dtype=np.int8)
+	col_buf = np.zeros((B, MAX_P), dtype=np.int8)
+	st_buf = np.zeros((B, MAX_P), dtype=np.int8)
+	re_buf = np.full(B, -1, dtype=np.int8)
+	done_buf = np.zeros(B, dtype=np.bool_)
 
 	for b, game in enumerate(snapshots):
 		n = game.num_players
-		num_players[b] = n
-		current_player[b] = game.current_player
-		scouts_since_play[b] = game.scouts_since_play
-		phase[b] = PHASE_SNS_PLAY if game.phase == Phase.SNS_PLAY else PHASE_TURN
+		np_buf[b] = n
+		cp_buf[b] = game.current_player
+		ssp_buf[b] = game.scouts_since_play
+		phase_buf[b] = PHASE_SNS_PLAY if game.phase == Phase.SNS_PLAY else PHASE_TURN
 		if game.phase not in (Phase.TURN, Phase.SNS_PLAY):
-			done[b] = True
+			done_buf[b] = True
 
 		for p in range(n):
-			ps = game.players[p]
-			hl = len(ps.hand)
-			hand_len[b, p] = hl
-			for i, (sv, hv) in enumerate(ps.hand):
-				hands_show[b, p, i] = sv
-				hands_hide[b, p, i] = hv
-			collected[b, p] = len(ps.collected)
-			scout_tokens[b, p] = ps.scout_tokens
-			sns_available[b, p] = ps.sns_available
+			pstate = game.players[p]
+			hand = pstate.hand
+			hand_len = len(hand)
+			hl[b, p] = hand_len
+			if hand_len > 0:
+				# Batch-assign hand cards via numpy
+				arr = np.array(hand, dtype=np.int8)
+				hs[b, p, :hand_len] = arr[:, 0]
+				hh[b, p, :hand_len] = arr[:, 1]
+			col_buf[b, p] = len(pstate.collected)
+			st_buf[b, p] = pstate.scout_tokens
+			sns_buf[b, p] = pstate.sns_available
 
 		if game.current_play is not None:
 			cp = game.current_play
-			pl = len(cp.cards)
-			play_len[b] = pl
-			play_owner[b] = game.current_play_owner
-			play_type[b] = PLAY_SET if cp.play_type == PlayType.SET else PLAY_RUN
-			play_strength[b] = cp.strength
-			for i, (sv, hv) in enumerate(cp.cards):
-				play_show[b, i] = sv
-				play_hide[b, i] = hv
+			cards = cp.cards
+			plen = len(cards)
+			pl_buf[b] = plen
+			po_buf[b] = game.current_play_owner
+			pt_buf[b] = PLAY_SET if cp.play_type == PlayType.SET else PLAY_RUN
+			pstr_buf[b] = cp.strength
+			if plen > 0:
+				arr = np.array(cards, dtype=np.int8)
+				ps_buf[b, :plen] = arr[:, 0]
+				ph_buf[b, :plen] = arr[:, 1]
 
 	return GpuGameState(
-		hands_show=hands_show.to(device),
-		hands_hide=hands_hide.to(device),
-		hand_len=hand_len.to(device),
-		play_show=play_show.to(device),
-		play_hide=play_hide.to(device),
-		play_len=play_len.to(device),
-		play_owner=play_owner.to(device),
-		play_type=play_type.to(device),
-		play_strength=play_strength.to(device),
-		current_player=current_player.to(device),
-		phase=phase.to(device),
-		scouts_since_play=scouts_since_play.to(device),
-		sns_available=sns_available.to(device),
-		num_players=num_players.to(device),
-		collected=collected.to(device),
-		scout_tokens=scout_tokens.to(device),
-		round_ender=round_ender.to(device),
-		done=done.to(device),
+		hands_show=torch.from_numpy(hs).to(device),
+		hands_hide=torch.from_numpy(hh).to(device),
+		hand_len=torch.from_numpy(hl).to(device),
+		play_show=torch.from_numpy(ps_buf).to(device),
+		play_hide=torch.from_numpy(ph_buf).to(device),
+		play_len=torch.from_numpy(pl_buf).to(device),
+		play_owner=torch.from_numpy(po_buf).to(device),
+		play_type=torch.from_numpy(pt_buf).to(device),
+		play_strength=torch.from_numpy(pstr_buf).to(device),
+		current_player=torch.from_numpy(cp_buf).to(device),
+		phase=torch.from_numpy(phase_buf).to(device),
+		scouts_since_play=torch.from_numpy(ssp_buf).to(device),
+		sns_available=torch.from_numpy(sns_buf).to(device),
+		num_players=torch.from_numpy(np_buf).to(device),
+		collected=torch.from_numpy(col_buf).to(device),
+		scout_tokens=torch.from_numpy(st_buf).to(device),
+		round_ender=torch.from_numpy(re_buf).to(device),
+		done=torch.from_numpy(done_buf).to(device),
 	)
 
 
