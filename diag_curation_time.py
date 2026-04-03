@@ -20,7 +20,7 @@ for mult in [5, 10]:
 	print(f"\n--- curation_multiplier={mult} ---")
 	games = 100 * mult
 	t0 = time.time()
-	samples = play_games_q_v6(network, games, 4, training_seats=4,
+	samples, _ = play_games_q_v6(network, games, 4, training_seats=4,
 		temperature=0.0, epsilon=0.05)
 	play_time = time.time() - t0
 	print(f"  Play {games} games: {play_time:.1f}s  ({len(samples)} samples)")

@@ -1,5 +1,6 @@
 import sys
 import os
+import psutil
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -9,6 +10,7 @@ import math
 import time
 import textwrap
 from collections import deque
+from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -23,7 +25,7 @@ from training import (
 	prepare_ppo_batch, subsample_batch, concatenate_batches, ppo_update, direct_pg_update,
 	play_games_v6, play_games_with_rollouts_v6, prepare_ppo_batch_v6, subsample_batch_v6,
 	concatenate_batches_v6, ppo_update_v6, augment_rotation_v6,
-	play_games_q_v6, curate_samples, rollout_multi_action_v6, prepare_q_batch_v6, q_update_v6,
+	play_games_q_v6, attach_snapshots, curate_samples, rollout_multi_action_v6, prepare_q_batch_v6, q_update_v6,
 	ReplayBuffer,
 )
 from game_log import GameLog
@@ -227,26 +229,36 @@ Q_PARAMS = {
 	"num_players": 4,
 	"layer_sizes": [256, 128],
 	"learning_rate": 0.0003,
-	"training_epochs": 3,
+	# "training_epochs": 3,
+	"training_epochs": 1,
 	"mini_batch_size": 1024 * 16,
-	"game_count": 100,
-	"curation_multiplier": 10,
-	"temperature": 0.0,
-	"epsilon": 0.05,
-	"rollout_actions_per_sample": 10,
-	"rollout_actions_random_extra": 2,
-	"rollouts_per_action": 30,
-	"rollout_temperature": 1.0,
+	# "game_count": 100,
+	"game_count": 10,
+	# "game_count": 1,
+	# "curation_multiplier": 3,
+	# "curation_multiplier": 10,
+	"curation_multiplier": 20,
+	"temperature": 0.5,
+	"epsilon": 0.1,
+	# "rollout_actions_per_sample": 10,
+	"rollout_actions_per_sample": 4,
+	# "rollout_actions_random_extra": 2,
+	"rollout_actions_random_extra": 1,
+	# "rollouts_per_action": 25, # probably want se of means to be about 0.3x spread of means, or just get se of means to a good value (in margin units)
+	"rollouts_per_action": 15,
+	"rollout_temperature": 0.3, # think gap size (in margin units) where it starts to have strong opinions
 	"augment_rotations": 16,
-	"cohort_check_interval": 5,
+	# "cohort_check_interval": 5,
+	"cohort_check_interval": 1,
 	"replay_check_perc": 0.1,
-	"replay_margin_max_diff": 0.4,  # TODO: tune — max MAE before cohort is killed
+	"replay_margin_max_diff": 0.4,
 	"min_replay_perc": 0.3,
 	"log_interval": 1,
 	"eval_interval": 5,
 	"save_interval_hours": 3,
-	"attention": {"dim": 20, "heads": 4, "layers": 3},
-	"save_dir": "bots/v8_0",
+	# "attention": {"dim": 20, "heads": 4, "layers": 3},
+	"attention": {"dim": 20, "heads": 4, "layers": 2},
+	"save_dir": "bots/v8_3",
 	"eval_opponents": {
 		"v1_4": "bots/v1_4/latest.pt",
 		"v2_5": "bots/v2_5/latest.pt",
@@ -332,8 +344,8 @@ def _count_dormant_neurons(network, states, threshold=0.01):
 		h.remove()
 	return result
 
-def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir, chart_fn=None):
-	"""Run eval vs all opponents, update metrics, save charts."""
+def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir):
+	"""Run eval vs all opponents, update metrics."""
 	# Eval runs infrequently — move to CPU to avoid batch-1 GPU overhead
 	# and device mismatches in probe code that expects CPU tensors
 	was_cuda = next(network.parameters()).is_cuda
@@ -352,12 +364,12 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 				total_margin += scores[0] - mean_opponent
 			avg_margin = total_margin / n_eval
 			metrics_history[f"eval_margin_{name}"].append(avg_margin)
-			print(f"  Eval vs {name}: margin={avg_margin:+.1f}")
+			tqdm.write(f"  Eval vs {name}: margin={avg_margin:+.1f}")
 		scout_len, scout_n = eval_scout_quality(network, n_samples=200)
 		metrics_history["scout_play_len"].append(scout_len)
-		print(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
+		tqdm.write(f"  Scout play_len: {scout_len:.2f} (n={scout_n})")
 	except Exception as e:
-		print(f"  WARNING: eval failed at iter {iteration}: {e}")
+		tqdm.write(f"  WARNING: eval failed at iter {iteration}: {e}")
 		expected_keys = [f"eval_margin_{n}" for n in eval_opponents]
 		expected_keys.append("scout_play_len")
 		if (metrics_history["eval_iteration"]
@@ -369,7 +381,6 @@ def _run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir
 	finally:
 		if was_cuda:
 			network.cuda()
-	(chart_fn or _save_charts)(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	if cfg.get("diagnose"):
 		_save_diagnostic_charts(metrics_history, save_dir)
 
@@ -415,7 +426,7 @@ def _save_diagnostic_charts(metrics_history: dict, save_dir: str):
 			ax.set_facecolor(PANEL)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 50), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 		# [0,0] Signal vs Noise — advantage spread vs estimated rollout noise
@@ -547,7 +558,7 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 
@@ -563,7 +574,7 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 				ax.legend(fontsize=7, loc="upper right")
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 
@@ -571,7 +582,7 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 			"""Style helper for charts using eval_iteration x-axis."""
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 
@@ -697,7 +708,7 @@ def _save_charts(metrics_history: dict, save_dir: str, eval_opponent_names: set[
 		ax_mae.set_title("Value Accuracy", color=TEXT, fontsize=11)
 		ax_mae.text(0.5, -0.15, textwrap.fill(
 			"MAE = avg error in margin points (lower = better). Correlation = does ranking match (higher = better).", 45),
-			transform=ax_mae.transAxes, ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+			transform=ax_mae.transAxes, ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 		ax_mae.tick_params(axis="x", colors=SUBTEXT, labelsize=8)
 		ax_mae.grid(True, alpha=0.15, color=GRID)
 
@@ -783,17 +794,19 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 		fig, axes = plt.subplots(4, 4, figsize=(18, 20))
 		fig.patch.set_facecolor(BG)
 		fig.suptitle("Scout Bot Q-Network Training", fontsize=16, color=TEXT, y=0.98)
-		def plot_line(ax, key, title, desc, color):
+		def plot_line(ax, key, title, desc, color, ylim=None):
 			ax.set_facecolor(PANEL)
 			if key in trimmed:
 				ax.plot(iters[-len(trimmed[key]):], trimmed[key], alpha=0.25, color=color, linewidth=0.8)
 				ax.plot(iters[-len(smoothed[key]):], smoothed[key], color=color, linewidth=2)
+			if ylim:
+				ax.set_ylim(*ylim)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
-		def plot_multi(ax, series, title, desc, ylim=None):
+		def plot_multi(ax, series, title, desc, ylim=None, legend_loc="upper right"):
 			ax.set_facecolor(PANEL)
 			for key, label, color in series:
 				if key in trimmed:
@@ -802,16 +815,16 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 			if ylim:
 				ax.set_ylim(*ylim)
 			if ax.get_legend_handles_labels()[1]:
-				ax.legend(fontsize=7, loc="upper right")
+				ax.legend(fontsize=7, loc=legend_loc)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 		def _style_eval_ax(ax, title, desc):
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 		def plot_hist_snapshot(ax, bins_key, counts_key, title, desc, color):
@@ -825,7 +838,7 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 				ax.fill_between(centers, counts, alpha=0.15, color=color)
 			ax.set_title(title, color=TEXT, fontsize=11)
 			ax.text(0.5, -0.15, textwrap.fill(desc, 45), transform=ax.transAxes,
-					ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
+					ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
 			ax.tick_params(colors=SUBTEXT, labelsize=8)
 			ax.grid(True, alpha=0.15, color=GRID)
 		# Row 0: Primary metrics
@@ -847,14 +860,16 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 		_style_eval_ax(ax_eval, "Score Margin",
 			"P0 score minus mean opponent. Positive = winning.")
 		plot_line(axes[0, 1], "mse_loss", "MSE Loss",
-			"Masked MSE between predicted and rollout margins. Primary training metric.", "#ff6b6b")
+			"Masked MSE between predicted and rollout margins. Primary training metric.", "#ff6b6b",
+			ylim=(0, None))
 		plot_multi(axes[0, 2], [
 			("mean_pred_margin", "Predicted", "#5dadec"),
 			("mean_target_margin", "Target", "#69db7c"),
 		], "Pred vs Target Margin",
 			"Mean predicted vs target margin for rolled actions. Gap = systematic bias.")
 		plot_line(axes[0, 3], "steps_per_game", "Steps Per Game",
-			"Average decisions per game. Shorter = more decisive play.", "#e0aaff")
+			"Average decisions per game. Shorter = more decisive play.", "#e0aaff",
+			ylim=(0, None))
 		# Row 1: Play behavior
 		plot_multi(axes[1, 0], [
 			("play_len_1_pct", "1", "#ff6b6b"),
@@ -883,12 +898,13 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 			("sns_pct", "S&S", "#ff6b6b"),
 		], "Action Type Distribution",
 			"Fraction of each action type.", ylim=(0, 1))
-		# Row 2: Network health
+		# Row 2: Network health + rollout quality
 		plot_multi(axes[2, 0], [
 			("entropy_play", "Play", "#5dadec"),
 			("entropy_scout", "Scout", "#ff6b6b"),
 		], "Conditional Entropies",
-			"Softmax entropy over margin predictions. Play/Scout regions separate. Low = converging.")
+			"Softmax entropy over margin predictions. Play/Scout regions separate. Low = converging.",
+			ylim=(0, None))
 		plot_multi(axes[2, 1], [
 			("dormant_neurons_layer_0", "Layer 0", "#ff6b6b"),
 			("dormant_neurons_layer_1", "Layer 1", "#ffa552"),
@@ -896,38 +912,41 @@ def _save_q_charts(metrics_history: dict, save_dir: str,
 			("dormant_neurons_total", "Total", "#e0aaff"),
 		], "Dormant Neurons",
 			"Neurons with mean |activation| < 0.01. High count = underutilized capacity.")
-		ax_rb = axes[2, 2]
-		ax_rb.set_facecolor(PANEL)
-		if "replay_alive_cohorts" in trimmed:
-			ax_rb.plot(iters[-len(smoothed["replay_alive_cohorts"]):],
-					   smoothed["replay_alive_cohorts"], color="#5dadec", linewidth=2, label="Cohorts")
-		ax_rb.set_ylabel("Cohorts", color="#5dadec", fontsize=8)
-		ax_rb.tick_params(axis="y", colors="#5dadec", labelsize=8)
-		ax_rb2 = ax_rb.twinx()
-		if "replay_total_samples" in trimmed:
-			ax_rb2.plot(iters[-len(smoothed["replay_total_samples"]):],
-						smoothed["replay_total_samples"], color="#69db7c", linewidth=2, label="Samples")
-		ax_rb2.set_ylabel("Total Samples", color="#69db7c", fontsize=8)
-		ax_rb2.tick_params(axis="y", colors="#69db7c", labelsize=8)
-		lines1, labels1 = ax_rb.get_legend_handles_labels()
-		lines2, labels2 = ax_rb2.get_legend_handles_labels()
-		if lines1 or lines2:
-			ax_rb.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
-		ax_rb.set_title("Replay Buffer", color=TEXT, fontsize=11)
-		ax_rb.text(0.5, -0.15, textwrap.fill(
-			"Alive cohorts and total replayable samples.", 45),
-			transform=ax_rb.transAxes, ha="center", va="top", fontsize=7, color=SUBTEXT, style="italic")
-		ax_rb.tick_params(axis="x", colors=SUBTEXT, labelsize=8)
-		ax_rb.grid(True, alpha=0.15, color=GRID)
-		plot_line(axes[2, 3], "lr", "Learning Rate",
-			"Current learning rate.", "#74c0fc")
-		# Row 3: Distribution snapshots (histograms as line charts, x=value not iteration)
+		plot_hist_snapshot(axes[2, 2], "_hist_rollout_bins", "_hist_rollout_counts",
+			"Rollout Margins", "Distribution of rollout margins (latest snapshot).", "#69db7c")
+		plot_multi(axes[2, 3], [
+			("rollout_margin_spread", "Spread of means", "#69db7c"),
+			("mean_rollout_std", "SE of means", "#ff6b6b"),
+		], "Rollout Signal vs Noise",
+			"Spread across action targets vs uncertainty per target. SE > spread = unreliable rankings.",
+			ylim=(0, None), legend_loc="lower left")
+		# Row 3: Replay buffer + distributions
 		plot_hist_snapshot(axes[3, 0], "_hist_margin_bins", "_hist_margin_counts",
 			"Margin Predictions", "Distribution of predicted margins (latest snapshot).", "#5dadec")
-		plot_hist_snapshot(axes[3, 1], "_hist_rollout_bins", "_hist_rollout_counts",
-			"Rollout Margins", "Distribution of rollout margins (latest snapshot).", "#69db7c")
-		plot_hist_snapshot(axes[3, 2], "_hist_age_bins", "_hist_age_counts",
-			"Replay Buffer Age", "Age distribution of replay samples (latest snapshot).", "#e0aaff")
+		# Combined replay cohort chart: total + effective samples per age
+		ax_rc = axes[3, 1]
+		ax_rc.set_facecolor(PANEL)
+		cohort_ages = metrics_history.get("_cohort_ages")
+		cohort_total = metrics_history.get("_cohort_total_samples")
+		cohort_eff = metrics_history.get("_cohort_eff_samples")
+		if cohort_ages and cohort_total:
+			ax_rc.plot(cohort_ages, cohort_total, color="#e0aaff", alpha=0.5,
+					   linewidth=1.5, label="Total")
+			ax_rc.fill_between(cohort_ages, cohort_total, alpha=0.1, color="#e0aaff")
+		if cohort_ages and cohort_eff:
+			ax_rc.plot(cohort_ages, cohort_eff, color="#5dadec",
+					   linewidth=2, label="Effective")
+			ax_rc.fill_between(cohort_ages, cohort_eff, alpha=0.15, color="#5dadec")
+		ax_rc.invert_xaxis()
+		if ax_rc.get_legend_handles_labels()[1]:
+			ax_rc.legend(fontsize=7, loc="upper left")
+		ax_rc.set_title("Replay Cohorts by Age", color=TEXT, fontsize=11)
+		ax_rc.text(0.5, -0.15, textwrap.fill(
+			"Total vs effective (weighted) samples per cohort age. Gap = weight decay.", 45),
+			transform=ax_rc.transAxes, ha="center", va="top", fontsize=10, color=SUBTEXT, style="italic")
+		ax_rc.tick_params(colors=SUBTEXT, labelsize=8)
+		ax_rc.grid(True, alpha=0.15, color=GRID)
+		axes[3, 2].set_visible(False)
 		axes[3, 3].set_visible(False)
 		fig.subplots_adjust(left=0.05, right=0.98, top=0.96, bottom=0.03,
 						   hspace=0.40, wspace=0.25)
@@ -1605,6 +1624,8 @@ def train_q(config: dict | None = None):
 		"dormant_neurons_layer_0": [], "dormant_neurons_layer_1": [],
 		"dormant_neurons_layer_2": [],
 		"lr": [],
+		"mean_rollout_std": [],
+		"rollout_margin_spread": [],
 	}
 	start_iter = 1
 	# Auto-resume
@@ -1675,18 +1696,22 @@ def train_q(config: dict | None = None):
 					state[k] = v.cuda()
 	# Pre-training eval
 	if start_iter <= 1:
-		_run_eval(network, eval_opponents, metrics_history, 0, cfg, save_dir,
-				  chart_fn=_save_q_charts)
+		_run_eval(network, eval_opponents, metrics_history, 0, cfg, save_dir)
+		_save_q_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	last_snapshot_time = time.time()
 	iteration = start_iter
 	try:
-		for iteration in range(start_iter, cfg["total_iterations"] + 1):
+		pbar = tqdm(range(start_iter, cfg["total_iterations"] + 1),
+					desc="training", unit="iter", dynamic_ncols=True)
+		for iteration in pbar:
+			pbar.clear()
 			t0 = time.time()
 			# Self-play: collect QSamples
 			network.eval()
 			opponents = pool.sample(cfg["num_players"] - cfg["training_seats"]) or None
 			cm = cfg["curation_multiplier"]
-			samples = play_games_q_v6(
+			_rss = lambda: f"{psutil.Process().memory_info().rss / 1024**3:.1f}GB"
+			samples, game_replays = play_games_q_v6(
 				network, cfg["game_count"] * cm, cfg["num_players"],
 				training_seats=cfg["training_seats"],
 				temperature=cfg["temperature"],
@@ -1696,7 +1721,8 @@ def train_q(config: dict | None = None):
 			if cm > 1:
 				pool_size = len(samples)
 				samples = curate_samples(samples, cm)
-				print(f"  Curated {len(samples)} from {pool_size} samples")
+			attach_snapshots(samples, game_replays)
+			del game_replays
 			play_time = time.time() - t0
 			# Multi-action rollout
 			t1 = time.time()
@@ -1732,6 +1758,8 @@ def train_q(config: dict | None = None):
 			train_time = time.time() - t2
 			avg_metrics = {k: sum(em[k] for em in epoch_metrics) / len(epoch_metrics)
 						   for k in epoch_metrics[0]}
+			pbar.set_postfix(mse=f"{avg_metrics['mse_loss']:.4f}")
+			pbar.refresh()
 			# Snapshot to opponent pool
 			if iteration % cfg["snapshot_interval"] == 0:
 				pool.add(network)
@@ -1801,6 +1829,23 @@ def train_q(config: dict | None = None):
 					counts, edges = _np.histogram(ages, bins=bins)
 					metrics_history["_hist_age_bins"] = edges.tolist()
 					metrics_history["_hist_age_counts"] = counts.tolist()
+				# Replay cohort composition: total and effective samples per cohort age
+				cohort_ages = []
+				cohort_total_samples = []
+				cohort_eff_samples = []
+				for c in replay_buffer.get_alive_cohorts():
+					age = iteration - c["iteration"]
+					n_total = len(c["samples"])
+					if c is replay_buffer.cohorts[-1]:
+						n_eff = n_total  # current cohort: all used
+					else:
+						n_eff = max(1, int(c["weight"] * n_total))
+					cohort_ages.append(age)
+					cohort_total_samples.append(n_total)
+					cohort_eff_samples.append(n_eff)
+				metrics_history["_cohort_ages"] = cohort_ages
+				metrics_history["_cohort_total_samples"] = cohort_total_samples
+				metrics_history["_cohort_eff_samples"] = cohort_eff_samples
 				# Store metrics
 				metrics_history["iteration"].append(iteration)
 				metrics_history["mse_loss"].append(avg_metrics["mse_loss"])
@@ -1824,7 +1869,20 @@ def train_q(config: dict | None = None):
 						metrics_history[f"dormant_neurons_layer_{li}"].append(
 							dormant_info.get(f"layer_{li}", 0))
 				metrics_history["lr"].append(cfg["learning_rate"])
-				print(f"[iter {iteration:>5}] "
+				n_ro = max(cfg["rollouts_per_action"], 1)
+				rollout_ses_all = [st / n_ro**0.5 for s in samples if s.rollout_stds
+								  for st in s.rollout_stds]
+				metrics_history["mean_rollout_std"].append(
+					sum(rollout_ses_all) / max(len(rollout_ses_all), 1))
+				if rollout_margins_all:
+					rm_mean = sum(rollout_margins_all) / len(rollout_margins_all)
+					rm_var = sum((x - rm_mean) ** 2 for x in rollout_margins_all) / len(rollout_margins_all)
+					mean_se_sq = sum(se ** 2 for se in rollout_ses_all) / max(len(rollout_ses_all), 1)
+					corrected_var = max(0.0, rm_var - mean_se_sq)
+					metrics_history["rollout_margin_spread"].append(corrected_var ** 0.5)
+				else:
+					metrics_history["rollout_margin_spread"].append(0.0)
+				pbar.write(f"[iter {iteration:>5}] "
 					  f"mse={avg_metrics['mse_loss']:.4f}  "
 					  f"pred={avg_metrics['mean_pred_margin']:+.3f}  "
 					  f"targ={avg_metrics['mean_target_margin']:+.3f}  "
@@ -1832,7 +1890,8 @@ def train_q(config: dict | None = None):
 					  f"steps={n_steps}  "
 					  f"buf={rb_stats['alive_cohorts']}c/{rb_stats['total_samples']}s  "
 					  f"pool={len(pool.versions)}  "
-					  f"play={play_time:.1f}s  ro={rollout_time:.1f}s  train={train_time:.1f}s")
+					  f"play={play_time:.1f}s  ro={rollout_time:.1f}s  train={train_time:.1f}s  "
+					  f"mem={_rss()}")
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
 								save_dir, "latest.pt", pool=pool,
 								extra={"replay_buffer": replay_buffer.state_dict()})
@@ -1849,18 +1908,19 @@ def train_q(config: dict | None = None):
 				_save_checkpoint(network, optimizer, iteration, cfg, metrics_history,
 								save_dir, f"iter_{iteration}.pt",
 								extra={"replay_buffer": replay_buffer.state_dict()})
-				print(f"  Saved snapshot (iter {iteration})")
+				pbar.write(f"  Saved snapshot (iter {iteration})")
 			# Eval
 			if iteration % cfg["eval_interval"] == 0:
-				_run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir,
-						  chart_fn=_save_q_charts)
+				pbar.clear()
+				_run_eval(network, eval_opponents, metrics_history, iteration, cfg, save_dir)
+				pbar.refresh()
+			# Charts: every iteration for the first 10, then every eval_interval
+			if iteration < 10 or iteration % cfg["eval_interval"] == 0:
+				_save_q_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
 	except KeyboardInterrupt:
 		print(f"\nInterrupted at iteration {iteration}.")
-	# Final save
-	_save_checkpoint(network, optimizer, iteration, cfg, metrics_history, save_dir, "latest.pt",
-					pool=pool, extra={"replay_buffer": replay_buffer.state_dict()})
 	_save_q_charts(metrics_history, save_dir, set(eval_opponents), cfg=cfg)
-	print(f"Training complete. Saved to {save_dir}/latest.pt")
+	print(f"Training stopped. Latest checkpoint in {save_dir}/latest.pt")
 
 def main():
 	parser = argparse.ArgumentParser(description="Train a Scout card game bot")

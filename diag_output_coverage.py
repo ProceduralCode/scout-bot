@@ -28,7 +28,7 @@ network.eval()
 MULTIPLIER = 10
 
 print(f"Playing {100 * MULTIPLIER} games...")
-all_samples = play_games_q_v6(network, 100 * MULTIPLIER, 4, training_seats=4,
+all_samples, _ = play_games_q_v6(network, 100 * MULTIPLIER, 4, training_seats=4,
 	temperature=0.0, epsilon=0.05)
 print(f"  {len(all_samples)} total samples")
 

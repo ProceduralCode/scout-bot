@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 from torch import Tensor
 from numba import cuda
-from training import play_games_q_v6, rollout_multi_action_v6
+from training import play_games_q_v6, rollout_multi_action_v6, attach_snapshots
 from network import FlatScoutNetwork, batched_masked_sample
 from encoding import INPUT_SIZE_V6
 from gpu_engine import from_snapshots, repeat_state, GpuGameState, compute_scores_tensor
@@ -33,7 +33,8 @@ network.eval()
 
 # Warmup
 print("Warmup...")
-warmup = play_games_q_v6(network, 5, 4, training_seats=4, temperature=0.0, epsilon=0.05)
+warmup, warmup_replays = play_games_q_v6(network, 5, 4, training_seats=4, temperature=0.0, epsilon=0.05)
+attach_snapshots(warmup, warmup_replays)
 rollout_multi_action_v6(warmup, network, 4,
 	rollout_actions_per_sample=3, rollout_actions_random_extra=1,
 	rollouts_per_action=5, rollout_temperature=1.0, chunk_pairs=64)
@@ -46,8 +47,9 @@ from encoding import decode_flat_action
 from training import _apply_action_to_game
 from game import Phase
 
-samples = play_games_q_v6(network, 100, 4, training_seats=4,
+samples, game_replays = play_games_q_v6(network, 100, 4, training_seats=4,
 	temperature=0.0, epsilon=0.05)
+attach_snapshots(samples, game_replays)
 for sample in samples:
 	legal = np.where(sample.action_mask)[0]
 	outputs = sample.network_outputs[legal]

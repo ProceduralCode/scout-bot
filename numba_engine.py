@@ -14,7 +14,7 @@ from numba import cuda
 import numba.types as nbt
 
 from numba.core.errors import NumbaPerformanceWarning
-warnings.filterwarnings("ignore", "Grid size", category=NumbaPerformanceWarning)
+warnings.simplefilter("ignore", NumbaPerformanceWarning)
 
 from gpu_engine import GpuGameState, from_snapshots, compute_scores, compute_scores_tensor
 

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import random
 import copy
 from dataclasses import dataclass
+from tqdm import tqdm
 from game import Game, Phase
 from encoding import (
 	encode_state, encode_hand_both_orientations, get_action_type_mask,
@@ -79,7 +80,8 @@ class QSample:
 	game_id: int
 	play_length: int | None
 	scout_quality: int | None
-	snapshot: Game              # game state clone for revalidation rollouts
+	snapshot: Game | None = None # filled by attach_snapshots after curation
+	_turn_index: int = -1       # index into game replay actions (for deferred snapshots)
 	# Filled in after rollout phase
 	rolled_actions: list[int] | None = None
 	rollout_margins: list[float] | None = None
@@ -123,34 +125,57 @@ class ReplayBuffer:
 	def revalidate(self, network, cohort: dict, check_perc: float,
 				   rollouts_per_action: int, num_players: int,
 				   margin_max_diff: float, min_replay_perc: float,
-				   rollout_temperature: float = 1.0):
+				   rollout_temperature: float = 1.0, chunk_pairs: int = 512):
 		"""Re-rollout a subset of cohort samples with current network.
 		Updates cohort weight based on margin discrepancy. Marks dead if below threshold."""
 		samples = cohort["samples"]
 		n_check = max(1, int(check_perc * len(samples)))
 		check_samples = random.sample(samples, n_check)
-		# Re-rollout to get current margins (imported at call time to avoid circular deps)
-		from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state, compute_scores_tensor
+		from gpu_engine import from_snapshots as gpu_from_snapshots, repeat_state
 		from numba_engine import rollout_numba
-		total_mae = 0.0
-		n_compared = 0
+		# Collect all (sample, action_pos, action_idx, old_margin) pairs
+		pairs = []
 		for sample in check_samples:
 			if sample.rolled_actions is None:
 				continue
-			# Pick a subset of rolled actions to re-check
 			for i, action_idx in enumerate(sample.rolled_actions):
+				pairs.append((sample, i, action_idx, sample.rollout_margins[i]))
+		if not pairs:
+			return
+		# Batched rollout in chunks
+		total_mae = 0.0
+		n_compared = 0
+		for chunk_start in range(0, len(pairs), chunk_pairs):
+			chunk = pairs[chunk_start:chunk_start + chunk_pairs]
+			games = []
+			rollout_info = []  # (game_idx_in_batch, chunk_idx)
+			for ci, (sample, action_pos, action_idx, old_margin) in enumerate(chunk):
 				g = sample.snapshot.clone()
 				action = decode_flat_action(action_idx, sample.hand_offset)
 				_apply_action_to_game(g, action)
-				gpu_state = gpu_from_snapshots([g], device='cuda')
-				gpu_state = repeat_state(gpu_state, rollouts_per_action)
-				scores_t = rollout_numba(gpu_state, network,
-										 temperature=rollout_temperature)
-				sf = scores_t[:, :num_players].float()
-				total = sf.sum(dim=1, keepdim=True)
-				margins = (sf * num_players - total) / ((num_players - 1) * 10.0)
-				new_margin = margins[:, sample.player].mean().item()
-				old_margin = sample.rollout_margins[i]
+				if g.phase in (Phase.ROUND_OVER, Phase.GAME_OVER):
+					scores = g.cumulative_scores[:num_players]
+					ps = scores[sample.player]
+					total_s = sum(scores)
+					margin = (ps * num_players - total_s) / ((num_players - 1) * 10.0)
+					total_mae += abs(margin - old_margin)
+					n_compared += 1
+				else:
+					rollout_info.append((len(games), ci))
+					games.append(g)
+			if not games:
+				continue
+			gpu_state = gpu_from_snapshots(games, device='cuda')
+			gpu_state = repeat_state(gpu_state, rollouts_per_action)
+			scores_t = rollout_numba(gpu_state, network,
+									 temperature=rollout_temperature)
+			sf = scores_t[:, :num_players].float()
+			total_s = sf.sum(dim=1, keepdim=True)
+			all_margins = (sf * num_players - total_s) / ((num_players - 1) * 10.0)
+			all_margins = all_margins.view(len(games), rollouts_per_action, num_players)
+			for gi, ci in rollout_info:
+				sample, action_pos, action_idx, old_margin = chunk[ci]
+				new_margin = all_margins[gi, :, sample.player].mean().item()
 				total_mae += abs(new_margin - old_margin)
 				n_compared += 1
 		if n_compared == 0:
@@ -2552,6 +2577,12 @@ def _select_action_q_batched(logits: torch.Tensor, masks: torch.Tensor,
 							 temperature: float, epsilon: float) -> torch.Tensor:
 	"""Batched action selection. Returns [B] LongTensor."""
 	B = logits.shape[0]
+	# Prevent argmax/softmax over all-inf rows (games with no legal actions).
+	# Give empty-mask rows a dummy legal action; caller checks has_action separately.
+	has_any = masks.any(dim=1)
+	if not has_any.all():
+		masks = masks.clone()
+		masks[~has_any, 0] = True
 	if temperature == 0 and epsilon == 0:
 		return logits.masked_fill(~masks, float('-inf')).argmax(dim=1)
 	# Start with greedy/softmax selection
@@ -2573,16 +2604,18 @@ def _select_action_q_batched(logits: torch.Tensor, masks: torch.Tensor,
 			# For each epsilon slot, find the rand_indices-th legal action
 			for bi in eps_mask.nonzero(as_tuple=True)[0]:
 				legal = masks[bi].nonzero(as_tuple=True)[0]
+				if len(legal) == 0:
+					continue
 				actions[bi] = legal[rand_indices[bi] % len(legal)]
 	return actions
 
 def play_games_q_v6(network, game_count: int, num_players: int,
 					training_seats: int = 4, temperature: float = 0.0,
 					epsilon: float = 0.0, opponent_pool: list | None = None,
-					) -> list[QSample]:
-	"""Play games and collect QSamples with game snapshots for Q-network training.
-	Action selection: softmax(temperature) + epsilon-greedy.
-	Returns QSamples without rollout data (filled in later by rollout_multi_action_v6)."""
+					) -> tuple[list[QSample], list[dict]]:
+	"""Play games and collect QSamples for Q-network training.
+	Returns (samples, game_replays). Samples have snapshot=None — call
+	attach_snapshots() to fill snapshots for selected samples before rollouts."""
 	H = HAND_SLOTS_V6
 	all_samples: list[QSample] = []
 	network.eval()
@@ -2603,8 +2636,12 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 					nets.append(network)
 			game_networks.append(nets)
 		game_samples = [[] for _ in range(game_count)]
-		for g in games:
+		# Replay data for deferred snapshot creation
+		game_replays = [{'initial': None, 'flips': {}, 'actions': []}
+						for _ in range(game_count)]
+		for g_idx, g in enumerate(games):
 			g.start_round()
+			game_replays[g_idx]['initial'] = g.clone()
 		# === Flip phase (batched for training network) ===
 		flip_info = []
 		flip_normals = []
@@ -2628,7 +2665,9 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 			v_n = logits_n[:, :256].max(dim=1).values
 			v_f = logits_f[:, :256].max(dim=1).values
 			for i, (g_idx, p) in enumerate(flip_info):
-				games[g_idx].submit_flip_decision(p, do_flip=v_f[i].item() > v_n[i].item())
+				do_flip = v_f[i].item() > v_n[i].item()
+				games[g_idx].submit_flip_decision(p, do_flip=do_flip)
+				game_replays[g_idx]['flips'][p] = do_flip
 		# Opponent flips (unbatched)
 		for g_idx, g in enumerate(games):
 			for p in range(num_players):
@@ -2642,13 +2681,20 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 					logits_f = net.policy_logits(h_f)
 					v_n = logits_n[:256].max().item()
 					v_f = logits_f[:256].max().item()
-					g.submit_flip_decision(p, do_flip=v_f > v_n)
+					do_flip = v_f > v_n
+					g.submit_flip_decision(p, do_flip=do_flip)
+					game_replays[g_idx]['flips'][p] = do_flip
 		# === Turn phase (batched) ===
-		while any(g.phase in (Phase.TURN, Phase.SNS_PLAY) for g in games):
+		active = set(range(game_count))
+		pbar = tqdm(total=game_count, desc="    games", unit="game", leave=False)
+		while active:
 			train_pending = []
 			opp_pending = []
-			for g_idx, g in enumerate(games):
+			to_remove = []
+			for g_idx in sorted(active):
+				g = games[g_idx]
 				if g.phase not in (Phase.TURN, Phase.SNS_PLAY):
+					to_remove.append(g_idx)
 					continue
 				p = g.current_player
 				net = game_networks[g_idx][p]
@@ -2663,6 +2709,9 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 					train_pending.append(entry)
 				else:
 					opp_pending.append((entry, net))
+			if to_remove:
+				active -= set(to_remove)
+				pbar.update(len(to_remove))
 			if not train_pending and not opp_pending:
 				break
 			# Batched forward pass for training network
@@ -2682,11 +2731,13 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 					g = games[g_idx]
 					if not has_action_cpu[i]:
 						g._advance_turn()
+						game_replays[g_idx]['actions'].append(None)
 						continue
 					action_idx = actions_cpu[i]
 					action = decode_flat_action(action_idx, ho)
 					# Record QSample for training seats
 					if p < training_seats:
+						turn_idx = len(game_replays[g_idx]['actions'])
 						play_length = None
 						scout_quality = None
 						if action['type'] == 'play':
@@ -2714,25 +2765,55 @@ def play_games_q_v6(network, game_count: int, num_players: int,
 							game_id=g_idx,
 							play_length=play_length,
 							scout_quality=scout_quality,
-							snapshot=g.clone(),
+							_turn_index=turn_idx,
 						)
 						game_samples[g_idx].append(sample)
+					game_replays[g_idx]['actions'].append(action)
 					_apply_action_to_game(g, action)
 			# Opponent forward passes (unbatched)
 			for (g_idx, p, ho, state, mask_t, hand), net in opp_pending:
 				g = games[g_idx]
 				if not mask_t.any():
 					g._advance_turn()
+					game_replays[g_idx]['actions'].append(None)
 					continue
 				hidden = net(state)
 				logits = net.policy_logits(hidden)
 				action_idx, _ = masked_sample(logits, mask_t)
 				action = decode_flat_action(action_idx, ho)
+				game_replays[g_idx]['actions'].append(action)
 				_apply_action_to_game(g, action)
+		pbar.update(len(active))
+		pbar.close()
 		# Flatten all samples
-		for g_idx, g in enumerate(games):
+		for g_idx in range(game_count):
 			all_samples.extend(game_samples[g_idx])
-	return all_samples
+	return all_samples, game_replays
+
+def attach_snapshots(samples: list[QSample], game_replays: list[dict]):
+	"""Replay games and create snapshots only for the given samples.
+	Much less memory than snapshotting every decision point during play."""
+	from collections import defaultdict
+	by_game = defaultdict(list)
+	for sample in samples:
+		by_game[sample.game_id].append(sample)
+	for g_id, game_samples in by_game.items():
+		replay = game_replays[g_id]
+		needed = {}
+		for s in game_samples:
+			needed.setdefault(s._turn_index, []).append(s)
+		g = replay['initial'].clone()
+		for p in sorted(replay['flips']):
+			g.submit_flip_decision(p, do_flip=replay['flips'][p])
+		for turn_idx, action in enumerate(replay['actions']):
+			if turn_idx in needed:
+				snapshot = g.clone()
+				for s in needed[turn_idx]:
+					s.snapshot = snapshot
+			if action is None:
+				g._advance_turn()
+			else:
+				_apply_action_to_game(g, action)
 
 def curate_samples(samples: list[QSample], multiplier: int) -> list[QSample]:
 	"""Subsample from a larger pool, weighting toward samples with rare legal actions.
@@ -2798,7 +2879,10 @@ def rollout_multi_action_v6(samples: list[QSample], network, num_players: int,
 
 	# Step 3: Process in chunks through GPU rollout pipeline
 	margins_buf = {}  # (si, ai) → (mean_margin, std_margin)
-	for chunk_start in range(0, len(pairs), chunk_pairs):
+	total_chunks = (len(pairs) + chunk_pairs - 1) // chunk_pairs
+	pbar = tqdm(range(0, len(pairs), chunk_pairs), total=total_chunks,
+				desc="    rollouts", unit="chunk", leave=False)
+	for chunk_start in pbar:
 		chunk = pairs[chunk_start:chunk_start + chunk_pairs]
 		# Clone snapshots, apply candidate actions, separate done vs needs-rollout
 		games = []
